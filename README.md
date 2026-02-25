@@ -1,5 +1,5 @@
-# Spatial Transcriptomic Stratification of the Tumor Microenvironment via a Grid-Level Z-Axis Layering Index and Molecular Profiling
-# 基于网格级 Z 轴分层指数与分子轮廓的肿瘤微环境空间转录组分层
+# Spatial Transcriptomic Analysis of the Tumor Microenvironment via a Grid-Level Z-axis Stratification and Molecular Density
+# 基于网格级 Z 轴分层与分子密度的肿瘤微环境空间转录组分析
 
 ## Overview
 ## 概述
