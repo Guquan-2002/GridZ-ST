@@ -405,6 +405,9 @@ else:
     he_img = he_arr.reshape((-1,) + he_arr.shape[-2:])[0]
     he_img = he_img[::HE_DOWNSAMPLE_FACTOR, ::HE_DOWNSAMPLE_FACTOR]
 
+# Mirror Figure 2A vertically (top-bottom).
+he_img = np.flipud(he_img)
+
 fig, ax = plt.subplots(figsize=(10, 10))
 ax.imshow(he_img)
 ax.set_title("Figure 2A. H&E Stained Tissue Morphology", fontsize=15, fontweight="bold")
@@ -571,15 +574,14 @@ missing = required_cols - set(grid_pd.columns)
 if missing:
     raise ValueError(f"`grid_pd` missing required columns: {sorted(missing)}")
 
-# Support both column naming conventions from Part 4.
 z_col = "z_stacking_index_um" if "z_stacking_index_um" in grid_pd.columns else "z_stacking_index"
 if z_col not in grid_pd.columns:
     raise ValueError("Missing Z-dispersion column. Expected `z_stacking_index_um` or `z_stacking_index`.")
 
-x_col = "x_um" if "x_um" in grid_pd.columns else "x_phys"
-y_col = "y_um" if "y_um" in grid_pd.columns else "y_phys"
+x_col = "x_um"
+y_col = "y_um"
 if x_col not in grid_pd.columns or y_col not in grid_pd.columns:
-    raise ValueError("Missing grid centroid coordinates. Expected (`x_um`, `y_um`) or (`x_phys`, `y_phys`).")
+    raise ValueError("Missing grid centroid coordinates. Expected (`x_um`, `y_um`).")
 
 X_df = grid_pd[["transcript_count", z_col]].copy()
 X_df["log_density"] = np.log1p(X_df["transcript_count"])
@@ -1530,10 +1532,11 @@ def _ensure_score_tables():
         idx_df = idx_df.merge(region_map, on=["x_bin", "y_bin"], how="left")
         region_series = idx_df["region"].astype(str)
 
-    # Recover coordinates per grid
-    # Support both naming conventions from cleaned Part 4.
-    x_col = "x_um" if "x_um" in grid_pd.columns else "x_phys"
-    y_col = "y_um" if "y_um" in grid_pd.columns else "y_phys"
+    # Recover coordinates per grid.
+    x_col = "x_um"
+    y_col = "y_um"
+    if x_col not in grid_pd.columns or y_col not in grid_pd.columns:
+        raise ValueError("Missing coordinate columns in `grid_pd` (expected x_um/y_um).")
     coord_map = grid_pd[["x_bin", "y_bin", x_col, y_col]].drop_duplicates(["x_bin", "y_bin"])
 
     score_df = idx_df[["x_bin", "y_bin"]].merge(coord_map, on=["x_bin", "y_bin"], how="left")
@@ -1586,8 +1589,10 @@ def _ensure_score_tables():
 score_df_filtered, effect_df = _ensure_score_tables()
 
 # Coordinate column names (after harmonization)
-x_col = "x_um" if "x_um" in score_df_filtered.columns else "x_phys"
-y_col = "y_um" if "y_um" in score_df_filtered.columns else "y_phys"
+x_col = "x_um"
+y_col = "y_um"
+if x_col not in score_df_filtered.columns or y_col not in score_df_filtered.columns:
+    raise ValueError("Missing coordinate columns in `score_df_filtered` (expected x_um/y_um).")
 
 # Determine comparison regions (reuse the same logic as effect_df build)
 all_regions = score_df_filtered["region"].dropna().unique().tolist()
@@ -1848,8 +1853,8 @@ from scipy import stats
 if "grid_pd" not in globals():
     raise NameError("Missing `grid_pd`; run grid aggregation and clustering first.")
 
-x_col = "x_um" if "x_um" in grid_pd.columns else "x_phys"
-y_col = "y_um" if "y_um" in grid_pd.columns else "y_phys"
+x_col = "x_um"
+y_col = "y_um"
 z_col = "z_stacking_index_um" if "z_stacking_index_um" in grid_pd.columns else "z_stacking_index"
 
 required_grid_cols = {x_col, y_col, z_col, "region"}
@@ -1890,7 +1895,7 @@ coords = base[[x_col, y_col]].to_numpy(dtype=float)
 tree = cKDTree(coords)
 neighbor_lists = tree.query_ball_point(coords, r=RADIUS_UM)
 
-area_um2 = float(np.pi * (RADIUS_UM  2))
+area_um2 = float(np.pi * (RADIUS_UM ** 2))
 dominant = base["dominant_marker_group"].to_numpy()
 
 neighbor_count = np.empty(len(base), dtype=np.int32)
@@ -1990,9 +1995,9 @@ if "grid_pd" not in globals():
 if "score_df_filtered" not in globals():
     raise NameError("Missing `score_df_filtered`. Run marker-group scoring block (Figure 6) first.")
 
-# Resolve coordinate columns (prefer cleaned naming if present)
-x_col_gp = "x_um" if "x_um" in grid_pd.columns else "x_phys"
-y_col_gp = "y_um" if "y_um" in grid_pd.columns else "y_phys"
+# Resolve coordinate columns.
+x_col_gp = "x_um"
+y_col_gp = "y_um"
 
 # Resolve Z dispersion column (std dev within grid)
 z_col_gp = "z_stacking_index_um" if "z_stacking_index_um" in grid_pd.columns else "z_stacking_index"
@@ -2107,7 +2112,7 @@ def partial_spearman(x, y, covariate, min_n: int = 20):
 # -----------------------
 def metrics_for_radius(radius_um: float):
     neighbors = tree.query_ball_point(coords, r=float(radius_um))
-    area = float(np.pi * (radius_um  2))
+    area = float(np.pi * (radius_um ** 2))
 
     density_per_area = np.empty(len(base_std), dtype=float)
     heter_hard = np.empty(len(base_std), dtype=float)
@@ -2396,11 +2401,11 @@ def plot_interface_heatmap(
 if "base" not in globals():
     raise NameError("Missing `base`. Run the neighborhood/marker-group merge step first.")
 
-# Resolve coordinate columns (prefer *_um if present)
-x_col = "x_um" if "x_um" in base.columns else "x_phys"
-y_col = "y_um" if "y_um" in base.columns else "y_phys"
+# Resolve coordinate columns.
+x_col = "x_um"
+y_col = "y_um"
 if x_col not in base.columns or y_col not in base.columns:
-    raise ValueError("Missing coordinate columns in `base` (expected x_um/y_um or x_phys/y_phys).")
+    raise ValueError("Missing coordinate columns in `base` (expected x_um/y_um).")
 
 # Ensure region labels exist
 if "region" not in base.columns:
@@ -2709,8 +2714,8 @@ if "signed_base" not in globals():
     raise NameError("Missing `signed_base`. Run the signed-distance block first.")
 
 # Exclude metadata and derived columns; keep numeric features.
-x_col = "x_um" if "x_um" in signed_base.columns else "x_phys"
-y_col = "y_um" if "y_um" in signed_base.columns else "y_phys"
+x_col = "x_um"
+y_col = "y_um"
 
 exclude_cols = {
     x_col,
