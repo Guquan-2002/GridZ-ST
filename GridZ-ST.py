@@ -1,52 +1,56 @@
 # %%
-# %%
 # ===========================================================================
 # Data Initialization and Quality Control (QC)
 # ===========================================================================
 
-# Standard library imports
 import os
 import warnings
-
-# Third-party library imports
 import polars as pl
 
-# Notebook-level warning policy
-# 笔记本级别的告警策略
 warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------------
-# Quality Control (QC) parameters
-# 质量控制（QC）参数
-# ---------------------------------------------------------------------------
-# Transcript-level quality value (QV) threshold.
-# 转录本层面的质量值（QV）阈值。
-# Note: For a Phred-like score, QV=20 corresponds to an error probability of 10^(-QV/10)=0.01.
-# 注：若按 Phred 风格定义，QV=20 对应的错误概率为 10^(-QV/10)=0.01。
 QV_THRESHOLD = 10.0
 
-# ---------------------------------------------------------------------------
-# Spatial grid parameters
-# 空间网格参数
-# ---------------------------------------------------------------------------
-# Grid resolution in micrometers.
-# 网格分辨率（微米）。
+RANDOM_SEED = 412
 BIN_SIZE_UM = 10.0
+MIN_TRANSCRIPTS_PER_GRID = 10
 
-# Quantile cutoffs used for display or downstream filtering in later sections.
-# 分位数阈值用于后续章节的展示或下游筛选。
-DENSITY_QUANTILE_EXPLORE = 0.10
-Z_STD_HIGH_QUANTILE_EXPLORE = 0.50
-Z_STD_LOW_QUANTILE_EXPLORE = 0.50
+BASELINE_ORDER_MODE = "auto"
+BASELINE_FIT_REGION_Q = 0.60
+BASELINE_AIC_DELTA_MIN = 2.0
+BASELINE_PILOT_SIGMA_UM = 50.0
+BASELINE_CONFIDENCE_DOWNSCALE = 0.7
+BASELINE_LOCAL_TREND_Q = 0.75
+IMBALANCE_ENHANCE_ALPHA = 1.5
+CONF_REF_QUANTILE = 0.90
+CONF_SOFT_EXPONENT = 0.50
+CONF_RANK_BLEND = 0.50
 
-DENSITY_QUANTILE_DOWNSTREAM = 0.10
-Z_STD_HIGH_QUANTILE_DOWNSTREAM = 0.50
-Z_STD_LOW_QUANTILE_DOWNSTREAM = 0.50
+MORAN_KNN_K = 8
+MORAN_PERM_N = 999
+MORAN_MAX_POINTS = 25000
 
-# ---------------------------------------------------------------------------
-# File input/output paths
-# 文件输入输出路径
-# ---------------------------------------------------------------------------
+KDE_EDGE_MODE = "reflect_bbox"
+SIGMA_LIST_UM = [15, 30, 45]
+MIN_POINTS_NEIGHBOR = 30
+MIN_POINTS_HALF = 8
+
+K_RANGE = list(range(2, 9))
+K_SELECTION_BOOTSTRAPS = 8
+K_SELECTION_SUBSAMPLE_FRAC = 0.80
+K_STABILITY_MIN = 0.70
+
+LAMBDA_MODE = "stability"
+LAMBDA_GRID = None
+LAMBDA_MANUAL = None
+LAMBDA_STABILITY_REPEATS = 20
+LAMBDA_STABILITY_SUBSAMPLE_FRAC = 0.80
+
+MRF_SOLVER = "alpha_expansion"
+ICM_RESTARTS = 8
+ICM_MAX_ITER = 30
+
+
 INPUT_DIR = "input"
 OUTPUT_DIR = "."
 
@@ -58,29 +62,9 @@ HE_IMAGE_PATTERNS = [
     os.path.join(INPUT_DIR, "*_he_image.tif"),
 ]
 
-FIGURE_1C_PATH = os.path.join(OUTPUT_DIR, "global_overview.png")
-FIGURE_3B_EFFECT_SIZE_PATH = os.path.join(OUTPUT_DIR, "effect_size_overview.png")
-FIGURE_6A_SENSITIVITY_HEATMAP_PATH = os.path.join(OUTPUT_DIR, "sensitivity_heatmap.png")
-FIGURE_6B_SENSITIVITY_LINES_PATH = os.path.join(OUTPUT_DIR, "sensitivity_lines.png")
-FIGURE_6_DGE_COMBINED_PATH = os.path.join(OUTPUT_DIR, "dge_combined.png")
-FIGURE_7_PATHWAY_ENRICHMENT_PATH = os.path.join(OUTPUT_DIR, "pathway_enrichment.png")
-FIGURE_8_ENDOTHELIAL_PATH = os.path.join(OUTPUT_DIR, "endothelial_distribution.png")
-FIGURE_9_DISTANCE_GRADIENT_PATH = os.path.join(OUTPUT_DIR, "distance_gradient.png")
-
-# ---------------------------------------------------------------------------
-# Data loading (lazy)
-# 数据读取（惰性执行）
-# ---------------------------------------------------------------------------
 transcripts_lf = pl.scan_parquet(TRANSCRIPTS_PARQUET)
-
-# Reference count for this notebook configuration.
-# 本笔记本配置下的参考条目数。
 EXPECTED_RAW_TRANSCRIPT_COUNT = 42_638_083
 
-# ---------------------------------------------------------------------------
-# Data cleaning and filtering
-# 数据清理与过滤
-# ---------------------------------------------------------------------------
 raw_transcript_count = transcripts_lf.select(pl.len().alias("n")).collect().item()
 
 qc_lf = (
@@ -96,15 +80,10 @@ qc_lf = (
 
 df = qc_lf.collect()
 
-# ---------------------------------------------------------------------------
-# Report
-# 汇总输出
-# ---------------------------------------------------------------------------
 print("=" * 55)
 print("Xenium Spatial Transcriptomics QC Summary")
 print("=" * 55)
 print(f"Reference raw transcript count : {EXPECTED_RAW_TRANSCRIPT_COUNT:,}")
-print(f"Input raw transcript count     : {raw_transcript_count:,}")
 print(f"Post-QC transcript count       : {df.height:,}")
 print(f"Retained columns               : {df.width}")
 print("=" * 55)
@@ -112,646 +91,1680 @@ print("=" * 55)
 # %%
 # %%
 # ===========================================================================
-# Z-axis distribution and X-Z projection
-# Z 轴分布与 X-Z 投影
+# Geometry baseline correction + continuous fields (multi-scale) - faster core
+#   - merge rho + z-stats in one pass per sigma
+#   - avoid pandas scalar .at in inner loop
+#   - compute multiple weighted quantiles with single sort
 # ===========================================================================
 
-import matplotlib.pyplot as plt
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# Z-axis extraction and histogram aggregation
-# Z 轴提取与直方图汇总
-# ---------------------------------------------------------------------------
-# Summarize the distribution of z_location from post-QC transcripts (df).
-# 使用 QC 后的转录本表（df）汇总 z_location 的分布。
-z_um = df["z_location"]
-
-z_min_um = float(z_um.min())
-z_max_um = float(z_um.max())
-
-# Use equal-width bins over the observed Z range.
-# 在观测到的 Z 范围内使用等宽分箱。
-N_Z_BINS = 100
-z_edges = np.linspace(z_min_um, z_max_um, N_Z_BINS + 1)
-z_counts, _ = np.histogram(z_um.to_numpy(), bins=z_edges)
-z_centers = (z_edges[:-1] + z_edges[1:]) / 2.0
-
-# ---------------------------------------------------------------------------
-# Downsampling for visualization (X-Z projection)
-# 用于可视化的下采样（X-Z 投影）
-# ---------------------------------------------------------------------------
-# Sampling is applied only to scatter plotting.
-# 下采样仅用于散点图绘制。
-PLOT_SAMPLE_FRACTION = 0.01
-PLOT_SAMPLE_SEED = 412
-
-plot_df = df.sample(fraction=PLOT_SAMPLE_FRACTION, seed=PLOT_SAMPLE_SEED)
-x_um = plot_df["x_location"].to_numpy()
-z_plot_um = plot_df["z_location"].to_numpy()
-
-# ---------------------------------------------------------------------------
-# Visualization
-# 可视化
-# ---------------------------------------------------------------------------
-fig, (ax_hist, ax_xz) = plt.subplots(
-    1,
-    2,
-    figsize=(18, 5),
-    gridspec_kw={"width_ratios": [1, 1.6]},
-)
-
-ax_hist.bar(
-    z_centers,
-    z_counts,
-    width=(z_edges[1] - z_edges[0]) * 0.9,
-    color="crimson",
-    edgecolor="none",
-)
-ax_hist.set_title("Z-axis transcript distribution", fontsize=14, fontweight="bold")
-ax_hist.set_xlabel("Z location (um)", fontsize=12)
-ax_hist.set_ylabel("Transcript count", fontsize=12)
-ax_hist.grid(True, linestyle="--", alpha=0.6)
-
-ax_xz.scatter(x_um, z_plot_um, s=0.1, alpha=0.3, color="teal")
-ax_xz.set_title(
-    f"X-Z projection (downsampled)\n"
-    f"fraction={PLOT_SAMPLE_FRACTION}, seed={PLOT_SAMPLE_SEED}",
-    fontsize=14,
-    fontweight="bold",
-)
-ax_xz.set_xlabel("X location (um)", fontsize=12)
-ax_xz.set_ylabel("Z location (um)", fontsize=12)
-ax_xz.grid(True, linestyle="--", alpha=0.5)
-
-plt.tight_layout()
-plt.show()
-
-# ---------------------------------------------------------------------------
-# Z-axis summary statistics
-# Z 轴汇总统计
-# ---------------------------------------------------------------------------
-peak_bin_idx = int(np.argmax(z_counts))
-peak_z_um = float(z_centers[peak_bin_idx])
-peak_bin_count = int(z_counts[peak_bin_idx])
-
-print("=" * 55)
-print("Z-axis profiling summary")
-print("=" * 55)
-print(f"Z range (um)               : {z_min_um:.2f} ~ {z_max_um:.2f}")
-print(f"Histogram peak center (um) : {peak_z_um:.2f}")
-print(f"Max count per bin          : {peak_bin_count:,}")
-print(f"Histogram bins             : {N_Z_BINS}")
-print("=" * 55)
-
-# %%
-# %%
-# ===========================================================================
-# Global spatial overview (X-Y colored by Z)
-# 全局空间概览（X-Y 以 Z 着色）
-# ===========================================================================
-
-import matplotlib.pyplot as plt
-
-# Sampling is applied only to scatter plotting.
-# 下采样仅用于散点图绘制。
-PLOT_SAMPLE_FRACTION = 0.01
-PLOT_SAMPLE_SEED = 412
-
-plot_pd = df.sample(fraction=PLOT_SAMPLE_FRACTION, seed=PLOT_SAMPLE_SEED).to_pandas()
-
-fig, ax = plt.subplots(figsize=(12, 8))
-
-# Scatter plot of transcripts in X-Y, color-coded by Z coordinate.
-# 转录本在 X-Y 平面的散点图，并按 Z 坐标着色。
-sc = ax.scatter(
-    plot_pd["x_location"],
-    plot_pd["y_location"],
-    c=plot_pd["z_location"],
-    cmap="viridis",
-    s=0.5,
-    alpha=0.8,
-    edgecolors="none",
-    rasterized=True,  # Reduce output size for vector backends.
-    # 对于矢量后端，用栅格化降低输出体积。
-)
-
-ax.set_title(
-    "Global spatial overview\n(Colored by Z location)",
-    fontsize=16,
-    fontweight="bold",
-    pad=15,
-)
-ax.set_xlabel("X location (um)", fontsize=12)
-ax.set_ylabel("Y location (um)", fontsize=12)
-
-ax.set_aspect("equal")
-
-cbar = plt.colorbar(sc, ax=ax, shrink=0.8)
-cbar.set_label("Z location (um)", rotation=270, labelpad=15)
-
-ax.spines["top"].set_visible(False)
-ax.spines["right"].set_visible(False)
-
-plt.tight_layout()
-plt.show()
-
-# %%
-# %%
-# ===========================================================================
-# Spatial grid aggregation (density, Z dispersion, Z entropy)
-# 空间网格聚合（密度、Z 离散度、Z 熵）
-# ===========================================================================
-
-import glob
-import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import polars as pl
-import tifffile
-import pandas as pd
+import time
+from scipy.spatial import cKDTree
+from scipy.stats import norm
+from sklearn.linear_model import LinearRegression, HuberRegressor, RANSACRegressor
+
+BIN_SIZE_UM = float(globals().get("BIN_SIZE_UM", 10.0))
+MIN_TRANSCRIPTS_PER_GRID = int(globals().get("MIN_TRANSCRIPTS_PER_GRID", 10))
+
+BASELINE_ORDER_MODE = str(globals().get("BASELINE_ORDER_MODE", "auto")).lower()
+BASELINE_FIT_REGION_Q = float(globals().get("BASELINE_FIT_REGION_Q", 0.60))
+BASELINE_AIC_DELTA_MIN = float(globals().get("BASELINE_AIC_DELTA_MIN", 2.0))
+BASELINE_PILOT_SIGMA_UM = float(globals().get("BASELINE_PILOT_SIGMA_UM", 50.0))
+
+MORAN_KNN_K = int(globals().get("MORAN_KNN_K", 8))
+MORAN_PERM_N = int(globals().get("MORAN_PERM_N", 999))
+MORAN_MAX_POINTS = int(globals().get("MORAN_MAX_POINTS", 25000))
+
+KDE_EDGE_MODE = str(globals().get("KDE_EDGE_MODE", "reflect_bbox"))
+SIGMA_LIST_UM = [float(s) for s in globals().get("SIGMA_LIST_UM", [15, 30, 45])]
+
+MIN_POINTS_NEIGHBOR = int(globals().get("MIN_POINTS_NEIGHBOR", 30))
+MIN_POINTS_HALF = int(globals().get("MIN_POINTS_HALF", 8))
+RANDOM_SEED = int(globals().get("RANDOM_SEED", 412))
+BUILD_GEOM_FIELD_DF = bool(globals().get("BUILD_GEOM_FIELD_DF", False))
+GEOM_PLOT_MAX_POINTS = int(globals().get("GEOM_PLOT_MAX_POINTS", 150000))
+BASELINE_LOCAL_TREND_Q = float(globals().get("BASELINE_LOCAL_TREND_Q", 0.75))
+IMBALANCE_ENHANCE_ALPHA = float(globals().get("IMBALANCE_ENHANCE_ALPHA", 1.5))
+CONF_REF_QUANTILE = float(globals().get("CONF_REF_QUANTILE", 0.90))
+CONF_SOFT_EXPONENT = float(globals().get("CONF_SOFT_EXPONENT", 0.50))
+CONF_RANK_BLEND = float(globals().get("CONF_RANK_BLEND", 0.50))
+
+try:
+    from numba import njit
+    NUMBA_OK = True
+except Exception:
+    NUMBA_OK = False
+    print("Numba not available, falling back to python.")
+
+
+def _edge_corr(coords, s, bbox, mode):
+    if mode not in {"reflect_bbox", "renorm_mask"}:
+        return np.ones(len(coords), np.float32)
+    xmin, xmax, ymin, ymax = bbox
+    mx = norm.cdf((xmax - coords[:, 0]) / s) - norm.cdf((xmin - coords[:, 0]) / s)
+    my = norm.cdf((ymax - coords[:, 1]) / s) - norm.cdf((ymin - coords[:, 1]) / s)
+    return np.clip(mx * my, 1e-3, 1.0)
+
+
+def _nb_to_csr(nb, n):
+    # Flatten python list-of-lists to CSR arrays (indptr, indices)
+    indptr = np.zeros(n + 1, dtype=np.int64)
+    total = 0
+    for i in range(n):
+        L = nb[i]
+        total += (len(L) if L else 1)
+        indptr[i + 1] = total
+    indices = np.empty(total, dtype=np.int64)
+    p = 0
+    for i in range(n):
+        L = nb[i]
+        if not L:
+            indices[p] = i
+            p += 1
+            continue
+        for j in L:
+            indices[p] = j
+            p += 1
+    return indptr, indices
+
+
+if NUMBA_OK:
+    @njit(cache=True, fastmath=True)
+    def _weighted_std(z, w):
+        sw = 0.0
+        sz = 0.0
+        for i in range(z.shape[0]):
+            wi = w[i]
+            if wi > 0.0 and np.isfinite(z[i]):
+                sw += wi
+                sz += wi * z[i]
+        if sw <= 0.0:
+            return np.nan
+        mu = sz / sw
+        s2 = 0.0
+        for i in range(z.shape[0]):
+            wi = w[i]
+            if wi > 0.0 and np.isfinite(z[i]):
+                d = z[i] - mu
+                s2 += wi * d * d
+        v = s2 / sw
+        if v < 0.0:
+            v = 0.0
+        return np.sqrt(v)
+
+    @njit(cache=True, fastmath=True)
+    def _weighted_quantile_from_sorted(zs, ws, q):
+        sw = 0.0
+        for i in range(ws.shape[0]):
+            sw += ws[i]
+        if sw <= 0.0:
+            return np.nan
+        target = q * sw
+        c = 0.0
+        for i in range(ws.shape[0]):
+            c += ws[i]
+            if c >= target:
+                return zs[i]
+        return zs[zs.shape[0] - 1]
+
+    @njit(cache=True, fastmath=True)
+    def _compute_sigma_fields_csr(
+        coords, counts, z_res, indptr, indices,
+        s, inv, corr,
+        min_points_neighbor, min_points_half,
+        conf_local_scale, prior,
+    ):
+        n = coords.shape[0]
+        rho = np.zeros(n, np.float32)
+        zstd_all = np.empty(n, np.float32)
+        zstd_up = np.empty(n, np.float32)
+        zstd_lo = np.empty(n, np.float32)
+        zstd_diff = np.empty(n, np.float32)
+        mixing = np.empty(n, np.float32)
+        conf = np.empty(n, np.float32)
+        n_nbr = np.zeros(n, np.int64)
+        n_up = np.zeros(n, np.int64)
+        n_lo = np.zeros(n, np.int64)
+
+        for i in range(n):
+            a = indptr[i]
+            b = indptr[i + 1]
+            m = b - a
+            n_nbr[i] = m
+
+            # build weights and local z array
+            zi = np.empty(m, np.float32)
+            wi = np.empty(m, np.float32)
+            xi = coords[i, 0]
+            yi = coords[i, 1]
+
+            sw = 0.0
+            for t in range(m):
+                j = indices[a + t]
+                dx = coords[j, 0] - xi
+                dy = coords[j, 1] - yi
+                d2 = dx * dx + dy * dy
+                w = counts[j] * np.exp(-0.5 * d2 / (s * s))
+                wi[t] = w
+                zi[t] = z_res[j]
+                sw += w
+
+            if sw <= 0.0 or not np.isfinite(sw):
+                sw = float(m)
+                for t in range(m):
+                    wi[t] = 1.0
+
+            rho[i] = (sw * inv) / corr[i]
+
+            zstd_all[i] = _weighted_std(zi, wi)
+
+            # sort by zi (simple argsort via numpy in numba is limited; do insertion sort for m~small)
+            # For typical neighbor sizes (tens to low hundreds), insertion sort is OK.
+            for u in range(1, m):
+                zkey = zi[u]
+                wkey = wi[u]
+                v = u - 1
+                while v >= 0 and zi[v] > zkey:
+                    zi[v + 1] = zi[v]
+                    wi[v + 1] = wi[v]
+                    v -= 1
+                zi[v + 1] = zkey
+                wi[v + 1] = wkey
+
+            med = _weighted_quantile_from_sorted(zi, wi, 0.5)
+            q1 = _weighted_quantile_from_sorted(zi, wi, 1.0 / 3.0)
+            q2 = _weighted_quantile_from_sorted(zi, wi, 2.0 / 3.0)
+
+            # split up/low by med (need counts)
+            cu = 0
+            cl = 0
+            for t in range(m):
+                if zi[t] >= med:
+                    cu += 1
+                else:
+                    cl += 1
+            n_up[i] = cu
+            n_lo[i] = cl
+
+            # compute std on halves with shrinkage
+            if cu > 0:
+                zu = np.empty(cu, np.float32)
+                wu = np.empty(cu, np.float32)
+                p = 0
+                for t in range(m):
+                    if zi[t] >= med:
+                        zu[p] = zi[t]
+                        wu[p] = wi[t]
+                        p += 1
+                su = _weighted_std(zu, wu)
+                su2 = su * su if np.isfinite(su) else prior
+                frac = cu / max(min_points_half, 1)
+                if frac > 1.0:
+                    frac = 1.0
+                zstd_up[i] = np.sqrt(frac * su2 + (1.0 - frac) * prior)
+            else:
+                zstd_up[i] = np.sqrt(prior)
+
+            if cl > 0:
+                zl = np.empty(cl, np.float32)
+                wl = np.empty(cl, np.float32)
+                p = 0
+                for t in range(m):
+                    if zi[t] < med:
+                        zl[p] = zi[t]
+                        wl[p] = wi[t]
+                        p += 1
+                sl = _weighted_std(zl, wl)
+                sl2 = sl * sl if np.isfinite(sl) else prior
+                frac = cl / max(min_points_half, 1)
+                if frac > 1.0:
+                    frac = 1.0
+                zstd_lo[i] = np.sqrt(frac * sl2 + (1.0 - frac) * prior)
+            else:
+                zstd_lo[i] = np.sqrt(prior)
+
+            zstd_diff[i] = zstd_up[i] - zstd_lo[i]
+
+            # mixing via terciles
+            if np.isfinite(q1) and np.isfinite(q2) and q2 > q1:
+                s1 = 0.0
+                s2 = 0.0
+                sw2 = 0.0
+                for t in range(m):
+                    wt = wi[t]
+                    sw2 += wt
+                    if zi[t] < q1:
+                        s1 += wt
+                    elif zi[t] < q2:
+                        s2 += wt
+                if sw2 > 0.0:
+                    p1 = s1 / sw2
+                    p2 = s2 / sw2
+                    p3 = 1.0 - p1 - p2
+                    if p3 < 0.0:
+                        p3 = 0.0
+                    mixing[i] = 1.0 - (p1 * p1 + p2 * p2 + p3 * p3)
+                else:
+                    mixing[i] = np.nan
+            else:
+                mixing[i] = np.nan
+
+            cnb = m / max(min_points_neighbor, 1)
+            if cnb > 1.0:
+                cnb = 1.0
+            mh = cu if cu < cl else cl
+            ch = mh / max(min_points_half, 1)
+            if ch > 1.0:
+                ch = 1.0
+            conf[i] = cnb * ch * conf_local_scale[i]
+
+        return rho, zstd_all, zstd_up, zstd_lo, zstd_diff, mixing, conf, n_nbr, n_up, n_lo
+
+
+def compute_sigma_fields_fast(coords, counts, z_res, tree, bbox, sigma_um, conf_local_scale):
+    s = float(sigma_um)
+    inv = 1.0 / (2.0 * np.pi * s * s)
+    corr = _edge_corr(coords, s, bbox, KDE_EDGE_MODE)
+
+    nb = tree.query_ball_point(coords, r=3.0 * s)
+    n = len(coords)
+
+    indptr, indices = _nb_to_csr(nb, n)
+
+    prior = max(float(np.nanvar(z_res)), 1e-6)
+
+    if NUMBA_OK:
+        rho, zstd_all, zstd_up, zstd_lo, zstd_diff, mixing, conf, n_nbr, n_up, n_lo = _compute_sigma_fields_csr(
+            coords.astype(np.float32),
+            counts.astype(np.float32),
+            z_res.astype(np.float32),
+            indptr,
+            indices,
+            s,
+            inv,
+            corr.astype(np.float32),
+            int(MIN_POINTS_NEIGHBOR),
+            int(MIN_POINTS_HALF),
+            conf_local_scale.astype(np.float32),
+            float(prior),
+        )
+    else:
+        # fallback: call your previous python version (not included here)
+        raise RuntimeError("numba not available; install numba for speed")
+
+    return {
+        "sigma_um": s,
+        "rho_sigma": rho,
+        "z_std_all_sigma": zstd_all,
+        "z_std_up_sigma": zstd_up,
+        "z_std_low_sigma": zstd_lo,
+        "z_std_diff_sigma": zstd_diff,
+        "mixing_sigma": mixing,
+        "confidence_weight": np.clip(conf, 0.0, 1.0),
+        "n_neighbor": n_nbr,
+        "n_up": n_up,
+        "n_low": n_lo,
+    }
+def dm(x, y, order):
+    if order == "linear":
+        return np.c_[x, y]
+    return np.c_[x, y, x * x, x * y, y * y]
+
+
+def mk_ransac(thr, seed):
+    kw = dict(
+        random_state=seed,
+        max_trials=2000,
+        min_samples=0.2,
+        residual_threshold=float(thr),
+    )
+    try:
+        return RANSACRegressor(estimator=LinearRegression(), **kw)
+    except TypeError:
+        return RANSACRegressor(base_estimator=LinearRegression(), **kw)
+
+
+def fit_model(x, y, z, w, order, seed):
+    xm, xs = x.mean(), (x.std() or 1.0)
+    ym, ys = y.mean(), (y.std() or 1.0)
+    xx = (x - xm) / xs
+    yy = (y - ym) / ys
+    X = dm(xx, yy, order)
+
+    mad = np.median(np.abs(z - np.median(z)))
+    r = mk_ransac(max(1e-6, 1.5 * mad), seed)
+    try:
+        r.fit(X, z, sample_weight=w)
+    except TypeError:
+        r.fit(X, z)
+
+    inl = r.inlier_mask_ if r.inlier_mask_ is not None else np.ones(len(z), bool)
+
+    h = HuberRegressor(max_iter=300, epsilon=1.35)
+    try:
+        h.fit(X[inl], z[inl], sample_weight=w[inl])
+    except TypeError:
+        h.fit(X[inl], z[inl])
+
+    pred = h.predict(X)
+    rss = np.sum(w * (z - pred) ** 2) / max(np.mean(w), 1e-12)
+    k = X.shape[1] + 1
+    n = len(z)
+    return {
+        "order": order,
+        "h": h,
+        "xm": xm,
+        "xs": xs,
+        "ym": ym,
+        "ys": ys,
+        "inl": inl,
+        "aic": float(2 * k + n * np.log(max(rss / n, 1e-12))),
+    }
+
+
+def pred_model(m, x, y):
+    xx = (x - m["xm"]) / m["xs"]
+    yy = (y - m["ym"]) / m["ys"]
+    return m["h"].predict(dm(xx, yy, m["order"]))
+
+
+def wstd(v, w):
+    m = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    v = v[m]
+    w = w[m]
+    if v.size == 0:
+        return np.nan
+    mu = np.average(v, weights=w)
+    return float(np.sqrt(max(np.average((v - mu) ** 2, weights=w), 0.0)))
+
+
+def weighted_quantiles_sorted(v_sorted, w_sorted, qs):
+    """
+    v_sorted ascending, w_sorted aligned. Return quantiles at qs (list of floats in [0,1]).
+    Use cumulative weight CDF with linear interpolation.
+    """
+    ws = float(w_sorted.sum())
+    if ws <= 0:
+        return [np.nan for _ in qs]
+    c = np.cumsum(w_sorted) / ws
+    out = []
+    for q in qs:
+        out.append(float(np.interp(float(q), c, v_sorted)))
+    return out
+
+
+def moran(res, coords, k, nperm, maxp, seed, w=None):
+    x = np.asarray(res, np.float32)
+    c = np.asarray(coords, np.float32)
+    m = np.isfinite(x) & np.isfinite(c[:, 0]) & np.isfinite(c[:, 1])
+    x = x[m]
+    c = c[m]
+    if w is not None:
+        w = np.asarray(w, np.float32)[m]
+
+    if len(x) > maxp:
+        rng = np.random.default_rng(seed)
+        p = (w / w.sum()) if (w is not None and w.sum() > 0) else None
+        keep = np.sort(rng.choice(len(x), size=maxp, replace=False, p=p))
+        x = x[keep]
+        c = c[keep]
+
+    if len(x) < k + 3:
+        return np.nan, np.nan
+
+    nn = cKDTree(c).query(c, k=min(k + 1, len(x)))[1]
+    nn = nn[:, 1:] if nn.ndim > 1 else np.empty((len(x), 0), int)
+    if nn.shape[1] == 0:
+        return np.nan, np.nan
+
+    z = x - x.mean()
+    den = np.sum(z * z)
+    if den <= 0:
+        return np.nan, np.nan
+
+    kk = nn.shape[1]
+    obs = float(np.sum(z[:, None] * z[nn]) / kk / den)
+
+    rng = np.random.default_rng(seed + 17)
+    per = np.empty(int(nperm), np.float32)
+    for i in range(int(nperm)):
+        zp = z[rng.permutation(len(z))]
+        per[i] = np.sum(zp[:, None] * zp[nn]) / kk / den
+
+    p = float((1 + np.sum(np.abs(per) >= abs(obs))) / (len(per) + 1))
+    return obs, p
+
+
+def compute_edge_correction(coords, s, bbox, mode):
+    if mode not in {"reflect_bbox", "renorm_mask"}:
+        return np.ones(len(coords), np.float32)
+    xmin, xmax, ymin, ymax = bbox
+    mx = norm.cdf((xmax - coords[:, 0]) / s) - norm.cdf((xmin - coords[:, 0]) / s)
+    my = norm.cdf((ymax - coords[:, 1]) / s) - norm.cdf((ymin - coords[:, 1]) / s)
+    return np.clip(mx * my, 1e-3, 1.0)
+
+
 
 # ---------------------------------------------------------------------------
-# H&E whole-slide image (WSI) visualization
-# H&E 全视野图像（WSI）可视化
+# Build grids
 # ---------------------------------------------------------------------------
-# This section is not modified in this refactor.
-# 该部分在本次重构中不改动。
-
-# ---------------------------------------------------------------------------
-# Grid binning and metric aggregation (Polars)
-# 网格分箱与指标聚合（Polars）
-# ---------------------------------------------------------------------------
-BIN_SIZE_UM = float(globals().get("BIN_SIZE_UM", 20.0))
-MIN_TRANSCRIPTS_PER_GRID = 10
-
-# Entropy histogram definition (dataset-level edges).
-# 熵直方图定义（数据集层面的分箱边界）。
-Z_ENTROPY_HIST_BINS = 100
-MIN_Z_FOR_ENTROPY = 10
-
-print(
-    f"Aggregating grids (bin_size_um={BIN_SIZE_UM}) and computing metrics "
-    f"(min_count={MIN_TRANSCRIPTS_PER_GRID}, z_entropy_bins={Z_ENTROPY_HIST_BINS})..."
+df_binned = df.with_columns(
+    (pl.col("x_location") / BIN_SIZE_UM).floor().cast(pl.Int32).alias("x_bin"),
+    (pl.col("y_location") / BIN_SIZE_UM).floor().cast(pl.Int32).alias("y_bin"),
 )
 
-z_min_um = float(df["z_location"].min())
-z_max_um = float(df["z_location"].max())
-z_edges = np.linspace(z_min_um, z_max_um, int(Z_ENTROPY_HIST_BINS) + 1).astype(float)
-
-grid_lf = (
-    df.lazy()
-    .with_columns(
-        (pl.col("x_location") / BIN_SIZE_UM).floor().cast(pl.Int32).alias("x_bin"),
-        (pl.col("y_location") / BIN_SIZE_UM).floor().cast(pl.Int32).alias("y_bin"),
-        pl.col("z_location").cast(pl.Float64).alias("z_um"),
-    )
-    .group_by(["x_bin", "y_bin"])
+grid_tmp = (
+    df_binned.group_by(["x_bin", "y_bin"])
     .agg(
         pl.len().alias("transcript_count"),
-        pl.col("z_um").std().alias("z_stacking_index_um"),
-        pl.col("z_um").alias("z_values"),
+        pl.col("z_location").mean().alias("z_mean_um"),
     )
     .filter(pl.col("transcript_count") >= MIN_TRANSCRIPTS_PER_GRID)
     .with_columns(
-        (pl.col("x_bin") * BIN_SIZE_UM + (BIN_SIZE_UM / 2.0)).alias("x_um"),
-        (pl.col("y_bin") * BIN_SIZE_UM + (BIN_SIZE_UM / 2.0)).alias("y_um"),
+        (pl.col("x_bin") * BIN_SIZE_UM + BIN_SIZE_UM / 2.0).alias("x_um"),
+        (pl.col("y_bin") * BIN_SIZE_UM + BIN_SIZE_UM / 2.0).alias("y_um"),
     )
 )
 
-grid_pd = grid_lf.collect().to_pandas()
+grid_base = grid_tmp.to_pandas().sort_values(["x_bin", "y_bin"]).reset_index(drop=True)
+
+if grid_base.empty:
+    raise ValueError("No grids after filtering")
+
+coords = grid_base[["x_um", "y_um"]].to_numpy(np.float32)
+counts = grid_base["transcript_count"].to_numpy(np.float32)
+z = grid_base["z_mean_um"].to_numpy(np.float32)
+
+bbox = (coords[:, 0].min(), coords[:, 0].max(), coords[:, 1].min(), coords[:, 1].max())
+tree = cKDTree(coords)
+
+_t0 = time.perf_counter()
 
 # ---------------------------------------------------------------------------
-# Z entropy computation (NumPy, batch-oriented)
-# Z 熵计算（NumPy，批处理）
+# Pilot density for baseline fit region
 # ---------------------------------------------------------------------------
-# Shannon entropy is computed on a fixed histogram per grid.
-# 对每个网格使用固定分箱直方图计算香农熵。
-def shannon_entropy_from_hist(counts: np.ndarray) -> float:
-    """
-    Shannon entropy in bits from histogram counts.
-    由直方图计数计算以 bit 为单位的香农熵。
-    """
-    total = float(np.sum(counts))
-    if total <= 0:
-        return np.nan
-    p = counts.astype(float) / total
-    p = p[p > 0]
-    if p.size == 0:
-        return np.nan
-    return float(-np.sum(p * np.log2(p)))
-
-z_lists = grid_pd["z_values"].to_list()
-z_entropy = np.full(len(z_lists), np.nan, dtype=float)
-
-for i, z in enumerate(z_lists):
-    if z is None:
-        continue
-    z_arr = np.asarray(z, dtype=float)
-    z_arr = z_arr[np.isfinite(z_arr)]
-    if z_arr.size < MIN_Z_FOR_ENTROPY:
-        continue
-    counts, _ = np.histogram(z_arr, bins=z_edges, density=False)
-    z_entropy[i] = shannon_entropy_from_hist(counts)
-
-grid_pd["z_entropy"] = z_entropy
-grid_pd = grid_pd.drop(columns=["z_values"])
-grid_pd = grid_pd.dropna(subset=["z_stacking_index_um", "z_entropy"]).copy()
-
-# ---------------------------------------------------------------------------
-# Visualization
-# 可视化
-# ---------------------------------------------------------------------------
-fig, axes = plt.subplots(1, 3, figsize=(24, 7))
-ax_den, ax_zstd, ax_zent = axes
-
-DENSITY_VMAX = grid_pd["transcript_count"].quantile(0.98)
-ZSTD_VMIN = grid_pd["z_stacking_index_um"].quantile(0.10)
-ZSTD_VMAX = grid_pd["z_stacking_index_um"].quantile(0.90)
-ZENT_VMIN = grid_pd["z_entropy"].quantile(0.10)
-ZENT_VMAX = grid_pd["z_entropy"].quantile(0.90)
-
-sc1 = ax_den.scatter(
-    grid_pd["x_um"],
-    grid_pd["y_um"],
-    c=grid_pd["transcript_count"],
-    s=1.5,
-    cmap="viridis",
-    alpha=0.9,
-    edgecolors="none",
-    vmax=DENSITY_VMAX,
-    rasterized=True,
+pilot_fields = compute_sigma_fields_fast(
+    coords=coords,
+    counts=counts,
+    z_res=np.zeros_like(z),
+    tree=tree,
+    bbox=bbox,
+    sigma_um=BASELINE_PILOT_SIGMA_UM,
+    conf_local_scale=np.ones_like(z, dtype=np.float32),
 )
-ax_den.set_title("Grid density (transcript count)", fontsize=14, fontweight="bold")
-plt.colorbar(sc1, ax=ax_den, shrink=0.6)
+pilot = pilot_fields["rho_sigma"]
+del pilot_fields
+_t_pilot = time.perf_counter()
+print(f"[perf] pilot density: {_t_pilot - _t0:.2f}s")
 
-sc2 = ax_zstd.scatter(
-    grid_pd["x_um"],
-    grid_pd["y_um"],
-    c=grid_pd["z_stacking_index_um"],
-    s=1.5,
-    cmap="magma",
-    alpha=0.9,
-    edgecolors="none",
-    vmin=ZSTD_VMIN,
-    vmax=ZSTD_VMAX,
-    rasterized=True,
-)
-ax_zstd.set_title("Z dispersion (std, um)", fontsize=14, fontweight="bold")
-plt.colorbar(sc2, ax=ax_zstd, shrink=0.6)
+thr = float(np.quantile(pilot[np.isfinite(pilot)], BASELINE_FIT_REGION_Q))
+fit = pilot >= thr
+if fit.sum() < 50:
+    fit[np.argsort(-pilot)[: min(len(pilot), 5000)]] = True
 
-sc3 = ax_zent.scatter(
-    grid_pd["x_um"],
-    grid_pd["y_um"],
-    c=grid_pd["z_entropy"],
-    s=1.5,
-    cmap="inferno",
-    alpha=0.9,
-    edgecolors="none",
-    vmin=ZENT_VMIN,
-    vmax=ZENT_VMAX,
-    rasterized=True,
-)
-ax_zent.set_title("Z entropy (bits)", fontsize=14, fontweight="bold")
-plt.colorbar(sc3, ax=ax_zent, shrink=0.6, label="Shannon entropy (base 2)")
+lin = fit_model(coords[fit, 0], coords[fit, 1], z[fit], counts[fit], "linear", RANDOM_SEED)
+qua = fit_model(coords[fit, 0], coords[fit, 1], z[fit], counts[fit], "quadratic", RANDOM_SEED + 1)
 
-for ax in axes:
-    ax.set_aspect("equal")
-    ax.invert_yaxis()
-    ax.axis("off")
+if BASELINE_ORDER_MODE == "linear":
+    m = lin
+elif BASELINE_ORDER_MODE == "quadratic":
+    m = qua
+else:
+    m = qua if qua["aic"] <= lin["aic"] - BASELINE_AIC_DELTA_MIN else lin
 
-plt.tight_layout()
-plt.show()
+z_base = pred_model(m, coords[:, 0], coords[:, 1])
+z_res = z - z_base
 
-# ---------------------------------------------------------------------------
-# Correlation summary
-# 相关性汇总
-# ---------------------------------------------------------------------------
-
-print("=" * 55)
-print("Spatial grid aggregation summary")
-print("=" * 55)
-print(f"Z entropy histogram bins   : {Z_ENTROPY_HIST_BINS}")
-print(f"Total grids (after filters): {len(grid_pd):,}")
-
-print("=" * 55)
-
-# ---------------------------------------------------------------------------
-# PCA on grid-level features (density, Z dispersion, Z entropy)
-# 网格级特征的主成分分析（密度、Z 离散度、Z 熵）
-# ---------------------------------------------------------------------------
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-
-pca_features = ["transcript_count", "z_stacking_index_um", "z_entropy"]
-X_pca = grid_pd[pca_features].to_numpy(float)
-
-# Standardize before PCA (features have different scales).
-# PCA 前做标准化（各特征量纲不同）。
-X_pca_scaled = StandardScaler().fit_transform(X_pca)
-
-pca = PCA(n_components=len(pca_features))
-pca.fit(X_pca_scaled)
-
-print("=" * 55)
-print("PCA on grid-level features")
-print("=" * 55)
-print(f"Features: {pca_features}")
-print()
-print("Explained variance ratio per component:")
-for i, (ratio, cumul) in enumerate(
-    zip(pca.explained_variance_ratio_, np.cumsum(pca.explained_variance_ratio_))
+mi, mp = moran(z_res, coords, MORAN_KNN_K, MORAN_PERM_N, MORAN_MAX_POINTS, RANDOM_SEED, counts)
+if (
+    BASELINE_ORDER_MODE == "auto"
+    and m["order"] == "linear"
+    and np.isfinite(mi)
+    and np.isfinite(mp)
+    and mp < 0.01
+    and abs(mi) >= 0.03
 ):
-    print(f"  PC{i + 1}: {ratio:.4f}  (cumulative: {cumul:.4f})")
-print()
-print("Component loadings (rows=PC, cols=features):")
-loadings = pd.DataFrame(
-    pca.components_,
-    columns=pca_features,
-    index=[f"PC{i + 1}" for i in range(len(pca_features))],
-)
-print(loadings.round(4).to_string())
-print("=" * 55)
+    m = qua
+    z_base = pred_model(m, coords[:, 0], coords[:, 1])
+    z_res = z - z_base
+    mi, mp = moran(z_res, coords, MORAN_KNN_K, MORAN_PERM_N, MORAN_MAX_POINTS, RANDOM_SEED + 23, counts)
 
-# %%
-# ---------------------------------------------------------------------------
-# PCA visualization
-# PCA 可视化
-# ---------------------------------------------------------------------------
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
-import numpy as np
-
-pca_features = ["transcript_count", "z_stacking_index_um", "z_entropy"]
-X_pca = grid_pd[pca_features].to_numpy(float)
-X_pca_scaled = StandardScaler().fit_transform(X_pca)
-
-pca = PCA(n_components=len(pca_features))
-pcs = pca.fit_transform(X_pca_scaled)
-
-grid_pd["PC1"] = pcs[:, 0]
-grid_pd["PC2"] = pcs[:, 1]
-grid_pd["PC3"] = pcs[:, 2]
-
-evr = pca.explained_variance_ratio_
+trend = bool(np.isfinite(mi) and np.isfinite(mp) and mp < 0.01 and abs(mi) >= 0.03)
+if trend:
+    _down = float(globals().get("BASELINE_CONFIDENCE_DOWNSCALE", 0.7))
+    _q = float(np.clip(BASELINE_LOCAL_TREND_Q, 0.5, 0.99))
+    _thr = float(np.quantile(np.abs(z_res), _q))
+    conf_local_scale = np.where(np.abs(z_res) >= _thr, _down, 1.0).astype(np.float32)
+else:
+    conf_local_scale = np.ones_like(z_res, dtype=np.float32)
 
 # ---------------------------------------------------------------------------
-# Spatial maps of PC1, PC2, PC3
-# PC1、PC2、PC3 的空间分布图
+# Base point table (numpy-friendly)
 # ---------------------------------------------------------------------------
-fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+point_df = grid_base.copy()
+point_df["z_baseline"] = z_base
+point_df["z_residual"] = z_res
+point_df["baseline_fit_weight"] = np.where(fit, counts, 0.0)
 
-for i, (ax, pc_col) in enumerate(zip(axes, ["PC1", "PC2", "PC3"])):
-    vals = grid_pd[pc_col].to_numpy(float)
-    vmin, vmax = np.percentile(vals[np.isfinite(vals)], [2, 98])
+tmp = np.zeros(len(point_df), int)
+inl_idx = np.where(fit)[0]
+tmp[inl_idx[m["inl"]]] = 1
+point_df["baseline_inlier"] = tmp
 
-    sc = ax.scatter(
-        grid_pd["x_um"],
-        grid_pd["y_um"],
-        c=vals,
-        s=1.5,
-        cmap="RdBu_r",
-        alpha=0.9,
-        edgecolors="none",
-        vmin=vmin,
-        vmax=vmax,
-        rasterized=True,
+# Pre-extract metadata arrays to avoid pandas .at in loops
+x_bin_arr = point_df["x_bin"].to_numpy(int)
+y_bin_arr = point_df["y_bin"].to_numpy(int)
+x_um_arr = point_df["x_um"].to_numpy(np.float32)
+y_um_arr = point_df["y_um"].to_numpy(np.float32)
+tc_arr = point_df["transcript_count"].to_numpy(np.float32)
+
+# ---------------------------------------------------------------------------
+# Multi-scale fields (main heavy part, streaming to reduce memory)
+# ---------------------------------------------------------------------------
+wide = point_df[
+    [
+        "x_bin",
+        "y_bin",
+        "x_um",
+        "y_um",
+        "transcript_count",
+        "z_baseline",
+        "z_residual",
+        "baseline_inlier",
+        "baseline_fit_weight",
+    ]
+].copy()
+
+geom_chunks = [] if BUILD_GEOM_FIELD_DF else None
+for s in SIGMA_LIST_UM:
+    _t_sigma_start = time.perf_counter()
+    s = float(s)
+    tag = f"s{int(s)}"
+    f = compute_sigma_fields_fast(
+        coords=coords,
+        counts=counts,
+        z_res=z_res,
+        tree=tree,
+        bbox=bbox,
+        sigma_um=s,
+        conf_local_scale=conf_local_scale,
     )
-    ax.set_title(
-        f"{pc_col} ({evr[i]:.1%} variance)",
-        fontsize=14,
-        fontweight="bold",
+
+    wide[f"rho_sigma_{tag}"] = f["rho_sigma"]
+    wide[f"z_std_all_sigma_{tag}"] = f["z_std_all_sigma"]
+    wide[f"z_std_up_sigma_{tag}"] = f["z_std_up_sigma"]
+    wide[f"z_std_low_sigma_{tag}"] = f["z_std_low_sigma"]
+    wide[f"z_std_diff_sigma_{tag}"] = f["z_std_diff_sigma"]
+    wide[f"mixing_sigma_{tag}"] = f["mixing_sigma"]
+    _n_nb = f["n_neighbor"].astype(np.float32)
+    _n_half = np.minimum(f["n_up"], f["n_low"]).astype(np.float32)
+
+    _q = float(np.clip(CONF_REF_QUANTILE, 0.5, 0.99))
+    _nb_ref = float(np.quantile(_n_nb[_n_nb > 0], _q)) if np.any(_n_nb > 0) else 1.0
+    _hf_ref = float(np.quantile(_n_half[_n_half > 0], _q)) if np.any(_n_half > 0) else 1.0
+    _nb_ref = max(_nb_ref, 1.0)
+    _hf_ref = max(_hf_ref, 1.0)
+
+    _exp = float(max(CONF_SOFT_EXPONENT, 1e-6))
+    _c_nb = np.clip((_n_nb / _nb_ref) ** _exp, 0.0, 1.0)
+    _c_hf = np.clip((_n_half / _hf_ref) ** _exp, 0.0, 1.0)
+    _conf = np.clip(_c_nb * _c_hf * conf_local_scale, 0.0, 1.0)
+
+    _rb = float(np.clip(CONF_RANK_BLEND, 0.0, 1.0))
+    if _rb > 0.0 and len(_conf) > 1:
+        _ord = np.argsort(_conf)
+        _rank = np.empty_like(_conf)
+        _rank[_ord] = np.linspace(0.0, 1.0, len(_conf), endpoint=True)
+        _conf = (1.0 - _rb) * _conf + _rb * _rank
+
+    wide[f"confidence_weight_{tag}"] = np.clip(_conf, 0.0, 1.0)
+    wide[f"n_neighbor_{tag}"] = f["n_neighbor"]
+    wide[f"n_up_{tag}"] = f["n_up"]
+    wide[f"n_low_{tag}"] = f["n_low"]
+
+    _den = f["n_up"] + f["n_low"]
+    _imb_signed = np.divide(
+        f["n_up"] - f["n_low"],
+        _den,
+        out=np.zeros_like(f["z_std_diff_sigma"], dtype=np.float32),
+        where=_den > 0,
     )
-    ax.set_aspect("equal")
-    ax.invert_yaxis()
-    ax.axis("off")
-    plt.colorbar(sc, ax=ax, shrink=0.6)
+    _imb_abs = np.abs(_imb_signed)
+    _enh = f["z_std_diff_sigma"] * (1.0 + IMBALANCE_ENHANCE_ALPHA * _imb_abs)
 
-plt.suptitle("PCA spatial distribution", fontsize=16, fontweight="bold")
-plt.tight_layout()
-plt.show()
+    wide[f"imbalance_signed_{tag}"] = _imb_signed
+    wide[f"imbalance_abs_{tag}"] = _imb_abs
+    wide[f"z_std_diff_enhanced_{tag}"] = _enh
 
-# ---------------------------------------------------------------------------
-# Pairwise scatter: PC1 vs PC2, PC1 vs PC3, PC2 vs PC3
-# 两两散点图：PC1 vs PC2、PC1 vs PC3、PC2 vs PC3
-# ---------------------------------------------------------------------------
-# Downsample for scatter readability.
-# 为散点图可读性做下采样。
-SCATTER_N = min(20000, len(grid_pd))
-plot_sub = grid_pd.sample(n=SCATTER_N, random_state=42)
+    print(f"[perf] sigma={int(s)} done in {time.perf_counter() - _t_sigma_start:.2f}s")
 
-# Color by cluster if available, otherwise by transcript_count.
-# 若有聚类标签则按聚类着色，否则按 transcript_count 着色。
-has_cluster = "region" in plot_sub.columns and plot_sub["region"].nunique() > 1
-
-pairs = [("PC1", "PC2"), ("PC1", "PC3"), ("PC2", "PC3")]
-
-fig, axes = plt.subplots(1, 3, figsize=(21, 6))
-
-for ax, (px, py) in zip(axes, pairs):
-    if has_cluster:
-        regions = sorted(plot_sub["region"].unique())
-        palette = ctx.get("palette_region", None) if "ctx" in dir() else None
-        for reg in regions:
-            sub = plot_sub[plot_sub["region"] == reg]
-            color = palette[reg] if palette and reg in palette else None
-            ax.scatter(
-                sub[px], sub[py],
-                s=5, alpha=0.4, edgecolors="none",
-                label=reg, c=[color] * len(sub) if color else None,
-                rasterized=True,
+    if BUILD_GEOM_FIELD_DF:
+        geom_chunks.append(
+            pd.DataFrame(
+                {
+                    "x_bin": x_bin_arr,
+                    "y_bin": y_bin_arr,
+                    "x_um": x_um_arr,
+                    "y_um": y_um_arr,
+                    "transcript_count": tc_arr,
+                    "sigma_um": np.full(len(point_df), s, dtype=np.float32),
+                    "rho_sigma": f["rho_sigma"],
+                    "z_std_all_sigma": f["z_std_all_sigma"],
+                    "z_std_up_sigma": f["z_std_up_sigma"],
+                    "z_std_low_sigma": f["z_std_low_sigma"],
+                    "z_std_diff_sigma": f["z_std_diff_sigma"],
+                    "mixing_sigma": f["mixing_sigma"],
+                    "confidence_weight": np.clip(_conf, 0.0, 1.0),
+                    "n_neighbor": f["n_neighbor"],
+                    "n_up": f["n_up"],
+                    "n_low": f["n_low"],
+                    "imbalance_signed": _imb_signed,
+                    "imbalance_abs": _imb_abs,
+                    "z_std_diff_enhanced": _enh,
+                }
             )
-        ax.legend(markerscale=3, fontsize=9, frameon=False, loc="best")
-    else:
-        sc = ax.scatter(
-            plot_sub[px], plot_sub[py],
-            c=np.log1p(plot_sub["transcript_count"]),
-            s=5, alpha=0.4, cmap="viridis", edgecolors="none",
-            rasterized=True,
         )
-        plt.colorbar(sc, ax=ax, shrink=0.6, label="log1p(count)")
 
-    ix = int(px[-1]) - 1
-    iy = int(py[-1]) - 1
-    ax.set_xlabel(f"{px} ({evr[ix]:.1%})", fontsize=12)
-    ax.set_ylabel(f"{py} ({evr[iy]:.1%})", fontsize=12)
-    ax.set_title(f"{px} vs {py}", fontsize=14, fontweight="bold")
-    ax.grid(True, ls="--", alpha=0.3)
+if BUILD_GEOM_FIELD_DF:
+    geom_field_df = pd.concat(geom_chunks, axis=0, ignore_index=True) if geom_chunks else pd.DataFrame()
+else:
+    geom_field_df = None
 
-plt.suptitle("PCA pairwise projections", fontsize=16, fontweight="bold")
+ref = min(SIGMA_LIST_UM, key=lambda t: abs(float(t) - 30.0))
+tag = f"s{int(float(ref))}"
+
+grid_pd = wide.copy()
+grid_pd["z_std_all_ref"] = grid_pd[f"z_std_all_sigma_{tag}"]
+grid_pd["mixing_ref"] = grid_pd[f"mixing_sigma_{tag}"]
+grid_pd["z_std_diff_ref"] = grid_pd[f"z_std_diff_sigma_{tag}"]
+grid_pd["z_std_diff_enhanced"] = grid_pd[f"z_std_diff_enhanced_{tag}"]
+grid_pd["confidence_weight"] = grid_pd[f"confidence_weight_{tag}"].clip(0, 1)
+
+GEOMETRY_FEATURE_COLUMNS = [
+    c
+    for c in grid_pd.columns
+    if c.startswith("rho_sigma_")
+    or c.startswith("z_std_all_sigma_")
+    or c.startswith("z_std_diff_enhanced_")
+]
+CLASSIFICATION_FEATURE_COLUMNS = tuple(GEOMETRY_FEATURE_COLUMNS)
+CLASSIFICATION_GEOMETRY_ONLY = True
+
+qc_df = pd.DataFrame(
+    [
+        {
+            "AIC_linear": lin["aic"],
+            "AIC_quad": qua["aic"],
+            "delta_AIC": lin["aic"] - qua["aic"],
+            "Moran_I": mi,
+            "Moran_p": mp,
+            "baseline_qc_flag": "trend_remaining" if trend else "ok",
+        }
+    ]
+)
+
+_t_end = time.perf_counter()
+print(f"[perf] total geometry cell: {_t_end - _t0:.2f}s")
+
+print("=" * 72)
+print("Geometry preprocessing summary")
+print("=" * 72)
+print(f"Grid count: {len(grid_pd):,}")
+print(f"Selected baseline order: {m['order']}")
+print(f"AIC linear/quadratic: {lin['aic']:.3f}/{qua['aic']:.3f}")
+print(f"Moran's I residual: {mi:.4f} (p={mp:.4g})")
+print(f"Geometry feature columns: {len(GEOMETRY_FEATURE_COLUMNS)}")
+print(f"Imbalance enhance alpha: {IMBALANCE_ENHANCE_ALPHA}")
+print(f"Confidence tuning: q={CONF_REF_QUANTILE}, exp={CONF_SOFT_EXPONENT}, rank_blend={CONF_RANK_BLEND}")
+print(f"Confidence weight quantiles: p10={np.nanquantile(grid_pd['confidence_weight'],0.10):.3f}, p50={np.nanquantile(grid_pd['confidence_weight'],0.50):.3f}, p90={np.nanquantile(grid_pd['confidence_weight'],0.90):.3f}")
+print("=" * 72)
+
+if len(grid_pd) > GEOM_PLOT_MAX_POINTS:
+    _idx = np.random.default_rng(RANDOM_SEED).choice(len(grid_pd), size=GEOM_PLOT_MAX_POINTS, replace=False)
+    _plot_df = grid_pd.iloc[np.sort(_idx)]
+else:
+    _plot_df = grid_pd
+
+fig, ax = plt.subplots(1, 3, figsize=(21, 6))
+sc = ax[0].scatter(
+    _plot_df["x_um"],
+    _plot_df["y_um"],
+    c=_plot_df[f"rho_sigma_{tag}"],
+    s=2,
+    cmap="viridis",
+    edgecolors="none",
+    rasterized=True,
+)
+ax[0].set_title(f"rho sigma={int(ref)}")
+sc1 = ax[1].scatter(
+    _plot_df["x_um"],
+    _plot_df["y_um"],
+    c=_plot_df[f"z_std_all_sigma_{tag}"],
+    s=2,
+    cmap="magma",
+    edgecolors="none",
+    rasterized=True,
+)
+ax[1].set_title("z_std_all")
+sc2 = ax[2].scatter(
+    _plot_df["x_um"],
+    _plot_df["y_um"],
+    c=_plot_df[f"z_std_diff_sigma_{tag}"],
+    s=2,
+    cmap="coolwarm",
+    edgecolors="none",
+    rasterized=True,
+)
+ax[2].set_title("z_std_up - z_std_low")
+
+for s_, a_ in [(sc, ax[0]), (sc1, ax[1]), (sc2, ax[2])]:
+    plt.colorbar(s_, ax=a_, shrink=0.7)
+
+for a in ax:
+    a.set_aspect("equal")
+    a.invert_yaxis()
+    a.axis("off")
+
 plt.tight_layout()
 plt.show()
 
-# ---------------------------------------------------------------------------
-# Loadings bar chart
-# 载荷条形图
-# ---------------------------------------------------------------------------
-fig, axes = plt.subplots(1, 3, figsize=(18, 4), sharey=True)
+# 注意：这玩意吃内存
+# Note: This thing eats a lot of memory
 
-colors = ["#4C72B0", "#DD8452", "#55A868"]
 
-for i, ax in enumerate(axes):
-    loadings = pca.components_[i]
-    bars = ax.barh(pca_features, loadings, color=colors, edgecolor="none", height=0.5)
-    ax.axvline(0, color="black", lw=0.8)
-    ax.set_title(f"PC{i + 1} loadings ({evr[i]:.1%})", fontsize=12, fontweight="bold")
-    ax.set_xlim(-1, 1)
-    ax.grid(True, axis="x", ls="--", alpha=0.3)
 
-    for bar, val in zip(bars, loadings):
-        ax.text(
-            val + 0.03 * np.sign(val), bar.get_y() + bar.get_height() / 2,
-            f"{val:.3f}", va="center", fontsize=10,
-        )
 
-plt.suptitle("PCA component loadings", fontsize=14, fontweight="bold")
-plt.tight_layout()
-plt.show()
 
 # %%
-# %%
 # ===========================================================================
-# GMM clustering on grid-level features
-# 基于网格特征的 GMM 聚类
+# Z-layer diagnostics: confidence checks + sigma-grouped geometry feature maps
 # ===========================================================================
 
+import re
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+if "grid_pd" not in globals():
+    raise NameError("Missing grid_pd. Run geometry preprocessing cell first.")
+
+if "confidence_weight" not in grid_pd.columns:
+    raise ValueError("grid_pd missing confidence_weight")
+
+ref_sigma = min([float(s) for s in globals().get("SIGMA_LIST_UM", [30])], key=lambda t: abs(t - 30.0))
+tag = f"s{int(ref_sigma)}"
+
+diff_col = f"z_std_diff_sigma_{tag}" if f"z_std_diff_sigma_{tag}" in grid_pd.columns else "z_std_diff"
+if diff_col not in grid_pd.columns:
+    raise ValueError("Missing z_std_diff column in grid_pd")
+
+qc = grid_pd[["x_um", "y_um", "confidence_weight", diff_col]].copy()
+qc = qc.replace([np.inf, -np.inf], np.nan).dropna(subset=["confidence_weight", diff_col])
+
+if qc.empty:
+    raise ValueError("No valid rows for z-layer diagnostics")
+
+qc = qc.rename(columns={diff_col: "z_std_diff_use"})
+qc["abs_diff"] = qc["z_std_diff_use"].abs()
+
+CONF_HIGH = 0.70
+CONF_LOW = 0.40
+EXTREME_Q = 0.95
+
+ext_thr = float(qc["abs_diff"].quantile(EXTREME_Q))
+ext_mask = qc["abs_diff"] >= ext_thr
+
+frac_extreme = float(ext_mask.mean())
+frac_extreme_low_conf = float((ext_mask & (qc["confidence_weight"] < CONF_LOW)).mean())
+frac_extreme_high_conf = float((ext_mask & (qc["confidence_weight"] >= CONF_HIGH)).mean())
+
+print("=" * 72)
+print("Z-layer diagnostics summary")
+print("=" * 72)
+print(f"Reference sigma (um)                 : {ref_sigma}")
+print(f"Diff column used                     : {diff_col}")
+print(f"Rows analyzed                        : {len(qc):,}")
+print(f"|z_std_diff| {EXTREME_Q:.0%} quantile threshold : {ext_thr:.4f}")
+print(f"Extreme points fraction              : {frac_extreme:.2%}")
+print(f"Extreme & low-confidence (<{CONF_LOW}) : {frac_extreme_low_conf:.2%}")
+print(f"Extreme & high-confidence (>={CONF_HIGH}) : {frac_extreme_high_conf:.2%}")
+print("=" * 72)
+
+bins = pd.IntervalIndex.from_tuples([(0.0, 0.4), (0.4, 0.7), (0.7, 1.01)], closed="left")
+qc["conf_bin"] = pd.cut(qc["confidence_weight"], bins=bins).astype(str)
+qc.loc[qc["conf_bin"] == "nan", "conf_bin"] = "other"
+
+stat_df = (
+    qc.groupby("conf_bin", observed=True)["abs_diff"]
+    .agg(["count", "median", "mean"])
+    .reset_index()
+)
+print("abs(z_std_diff) by confidence bin:")
+print(stat_df[["conf_bin", "count", "median", "mean"]].to_string(index=False))
+
+plot_df = qc
+if len(plot_df) > 150000:
+    idx = np.random.default_rng(412).choice(len(plot_df), 150000, replace=False)
+    plot_df = plot_df.iloc[np.sort(idx)].copy()
+
+# --- Keep confidence diagnostics plots ---
+fig, axes = plt.subplots(1, 3, figsize=(19, 5.5))
+
+sc0 = axes[0].scatter(
+    plot_df["x_um"],
+    plot_df["y_um"],
+    c=plot_df["confidence_weight"],
+    s=1.5,
+    cmap="viridis",
+    edgecolors="none",
+    rasterized=True,
+)
+axes[0].set_title("Confidence weight map", fontweight="bold")
+plt.colorbar(sc0, ax=axes[0], shrink=0.8)
+axes[0].set_aspect("equal")
+axes[0].invert_yaxis()
+axes[0].set_xticks([])
+axes[0].set_yticks([])
+
+sample_n = min(60000, len(plot_df))
+ss = plot_df.sample(n=sample_n, random_state=412) if len(plot_df) > sample_n else plot_df
+axes[1].scatter(
+    ss["confidence_weight"],
+    ss["abs_diff"],
+    s=4,
+    alpha=0.15,
+    color="tab:blue",
+    edgecolors="none",
+)
+axes[1].axvline(CONF_LOW, ls="--", lw=1, color="gray")
+axes[1].axvline(CONF_HIGH, ls="--", lw=1, color="gray")
+axes[1].axhline(ext_thr, ls="--", lw=1, color="tomato")
+axes[1].set_xlabel("confidence_weight")
+axes[1].set_ylabel("abs(z_std_diff)")
+axes[1].set_title("Confidence vs abs(z_std_diff)", fontweight="bold")
+axes[1].grid(True, ls="--", alpha=0.3)
+
+sns.boxplot(
+    data=plot_df.assign(
+        conf_group=pd.cut(
+            plot_df["confidence_weight"],
+            bins=[0, CONF_LOW, CONF_HIGH, 1.0],
+            labels=["low", "mid", "high"],
+            include_lowest=True,
+        )
+    ),
+    x="conf_group",
+    y="abs_diff",
+    ax=axes[2],
+    showfliers=False,
+)
+axes[2].set_xlabel("confidence group")
+axes[2].set_ylabel("abs(z_std_diff)")
+axes[2].set_title("abs(z_std_diff) by confidence group", fontweight="bold")
+axes[2].grid(True, ls="--", alpha=0.2)
+
+plt.tight_layout()
+plt.show()
+
+# --- Replace diff map with sigma-grouped feature maps used by GMM ---
+if "GEOMETRY_FEATURE_COLUMNS" in globals():
+    feat_cols = [c for c in GEOMETRY_FEATURE_COLUMNS if c in grid_pd.columns]
+else:
+    prefixes = (
+        "rho_sigma_",
+        "z_std_all_sigma_",
+        "z_std_diff_enhanced_",
+    )
+    feat_cols = [c for c in grid_pd.columns if c.startswith(prefixes)]
+
+pairs = []
+for c in feat_cols:
+    m = re.match(r"^(.*)_s(\d+)$", c)
+    if m:
+        base = m.group(1)
+        sigma = int(m.group(2))
+        pairs.append((c, base, sigma))
+
+if not pairs:
+    raise ValueError("No *_sXX geometry columns found for sigma-grouped plotting.")
+
+bases_all = sorted({b for _, b, _ in pairs})
+sigmas = sorted({s for _, _, s in pairs})
+
+base_order_pref = [
+    "rho_sigma",
+    "z_std_all_sigma",
+    "z_std_diff_enhanced",
+]
+base_order = [b for b in base_order_pref if b in bases_all] + [b for b in bases_all if b not in base_order_pref]
+
+col_map = {(b, s): c for c, b, s in pairs}
+
+need = ["x_um", "y_um"] + [c for c, _, _ in pairs]
+map_df = grid_pd[need].copy()
+xy_ok = np.isfinite(map_df["x_um"].to_numpy(np.float32)) & np.isfinite(map_df["y_um"].to_numpy(np.float32))
+map_df = map_df.loc[xy_ok].reset_index(drop=True)
+
+MAX_POINTS = 180000
+if len(map_df) > MAX_POINTS:
+    rng = np.random.default_rng(42)
+    keep = np.sort(rng.choice(len(map_df), size=MAX_POINTS, replace=False))
+    map_df = map_df.iloc[keep].reset_index(drop=True)
+
+x = map_df["x_um"].to_numpy(np.float32)
+y = map_df["y_um"].to_numpy(np.float32)
+
+nrow = len(sigmas)
+ncol = len(base_order)
+fig, axes = plt.subplots(
+    nrow,
+    ncol,
+    figsize=(4.0 * ncol, 3.6 * nrow),
+    sharex=True,
+    sharey=True,
+    constrained_layout=True,
+)
+
+if nrow == 1 and ncol == 1:
+    axes = np.array([[axes]])
+elif nrow == 1:
+    axes = axes[np.newaxis, :]
+elif ncol == 1:
+    axes = axes[:, np.newaxis]
+
+for i, s in enumerate(sigmas):
+    for j, b in enumerate(base_order):
+        ax = axes[i, j]
+        c = col_map.get((b, s), None)
+
+        if c is None:
+            ax.axis("off")
+            continue
+
+        v = map_df[c].to_numpy(np.float32)
+        ok = np.isfinite(v)
+        if ok.sum() == 0:
+            ax.set_title(f"{b}\n(no finite)", fontsize=9)
+            ax.axis("off")
+            continue
+
+        lo, hi = np.nanpercentile(v[ok], [2, 98])
+        if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (lo == hi):
+            lo, hi = float(np.nanmin(v[ok])), float(np.nanmax(v[ok]))
+            if lo == hi:
+                lo -= 1e-9
+                hi += 1e-9
+
+        sc = ax.scatter(
+            x[ok],
+            y[ok],
+            c=v[ok],
+            s=2,
+            cmap="viridis",
+            vmin=lo,
+            vmax=hi,
+            edgecolors="none",
+            rasterized=True,
+        )
+        if i == 0:
+            ax.set_title(b, fontsize=10)
+        if j == 0:
+            ax.set_ylabel(f"sigma={s}", fontsize=10)
+        ax.set_aspect("equal", adjustable="box")
+        ax.invert_yaxis()
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+        cb.ax.tick_params(labelsize=7)
+
+fig.suptitle(
+    f"GMM geometry features grouped by sigma (points={len(map_df):,})",
+    fontsize=14,
+)
+plt.show()
+
+
+# %%
+# %%
+# ===========================================================================
+# Geometry-only clustering (FAST): GMM (diag) data term + Potts MRF smoothing
+#   - vectorized grid edges via 2D index map
+#   - GMM covariance_type=diag (much faster)
+#   - stability eval uses fixed eval subset (no full predict per bootstrap)
+#   - CSR neighbors + numba ICM (fallback to python if numba missing)
+#   - optional pygco alpha-expansion if installed
+# ===========================================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib.colors import LinearSegmentedColormap
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import adjusted_rand_score
 
-# ---------------------------------------------------------------------------
-# Configuration
-# 配置
-# ---------------------------------------------------------------------------
-N_COMPONENTS = 6
-RANDOM_SEED = 412
+RANDOM_SEED = int(globals().get("RANDOM_SEED", 412))
+K_RANGE = [int(k) for k in globals().get("K_RANGE", list(range(2, 9)))]
 
-# Feature selection for GMM.
-# GMM 使用的特征选择。
-# Supported keys: "log_density", "z_std", "z_entropy"
-# 可用键： "log_density", "z_std", "z_entropy"
-GMM_FEATURE_KEYS = ("log_density", "z_std")
+# K selection
+K_SELECTION_BOOTSTRAPS = int(globals().get("K_SELECTION_BOOTSTRAPS", 8))
+K_SELECTION_SUBSAMPLE_FRAC = float(globals().get("K_SELECTION_SUBSAMPLE_FRAC", 0.8))
+K_STABILITY_MIN = float(globals().get("K_STABILITY_MIN", 0.70))
 
-# Default compare pair uses the last two clusters after sorting by transcript_count.
-# 默认对比组使用按 transcript_count 排序后的最后两个簇。
-COMPARE_CLUSTER_A = N_COMPONENTS - 2
-COMPARE_CLUSTER_B = N_COMPONENTS - 1
+# Lambda selection
+LAMBDA_MODE = str(globals().get("LAMBDA_MODE", "stability")).lower()
+LAMBDA_GRID_CFG = globals().get("LAMBDA_GRID", None)
+LAMBDA_MANUAL = globals().get("LAMBDA_MANUAL", None)
+LAMBDA_STABILITY_REPEATS = int(globals().get("LAMBDA_STABILITY_REPEATS", 12))  # lowered default
+LAMBDA_STABILITY_SUBSAMPLE_FRAC = float(globals().get("LAMBDA_STABILITY_SUBSAMPLE_FRAC", 0.8))
 
-# ---------------------------------------------------------------------------
-# Input checks
-# 输入检查
-# ---------------------------------------------------------------------------
-required_cols = {"transcript_count", "x_um", "y_um"}
-missing = required_cols - set(grid_pd.columns)
-if missing:
-    raise ValueError(f"grid_pd missing required columns: {sorted(missing)}")
+MRF_SOLVER = str(globals().get("MRF_SOLVER", "alpha_expansion")).lower()
+ICM_RESTARTS = int(globals().get("ICM_RESTARTS", 6))  # lowered default
+ICM_MAX_ITER = int(globals().get("ICM_MAX_ITER", 25))  # lowered default
 
-z_std_col = "z_stacking_index_um" if "z_stacking_index_um" in grid_pd.columns else "z_stacking_index"
-if z_std_col not in grid_pd.columns:
-    raise ValueError("grid_pd missing z dispersion column (z_stacking_index_um or z_stacking_index)")
+# Performance knobs
+GMM_COV = str(globals().get("GMM_COVARIANCE_TYPE", "diag")).lower()  # "diag" recommended
+EVAL_N = int(globals().get("K_STABILITY_EVAL_N", 120000))  # subset used to compare bootstrap labelings
+EDGE_CONNECTIVITY = int(globals().get("EDGE_CONNECTIVITY", 8))  # 4 or 8
+LAMBDA_STABILITY_TOPN = int(globals().get("LAMBDA_STABILITY_TOPN", 3))  # only run stability on best few lambdas
 
-x_col, y_col = "x_um", "y_um"
+if "grid_pd" not in globals() or "GEOMETRY_FEATURE_COLUMNS" not in globals():
+    raise NameError("Run geometry cell first (need grid_pd and GEOMETRY_FEATURE_COLUMNS).")
 
-feature_defs = {
-    "log_density": ("transcript_count", lambda d: np.log1p(d["transcript_count"].to_numpy(float))),
-    "z_std": (z_std_col, lambda d: d[z_std_col].to_numpy(float)),
-    "z_entropy": ("z_entropy", lambda d: d["z_entropy"].to_numpy(float)),
-}
+seg_input = grid_pd.copy()
+feature_cols = [c for c in GEOMETRY_FEATURE_COLUMNS if c in seg_input.columns]
+if not feature_cols:
+    raise ValueError("No geometry features found.")
 
-unknown_keys = sorted(set(GMM_FEATURE_KEYS) - set(feature_defs))
-if unknown_keys:
-    raise ValueError(f"Unknown feature keys in GMM_FEATURE_KEYS: {unknown_keys}")
+X_all = seg_input[feature_cols].to_numpy(np.float32)
+valid = np.all(np.isfinite(X_all), axis=1)
+if int(valid.sum()) < max(K_RANGE) * 50:
+    raise ValueError("Too few valid rows for clustering.")
 
-# Ensure required raw columns for selected features exist.
-# 检查所选特征所需的原始列是否存在。
-need_cols = {feature_defs[k][0] for k in GMM_FEATURE_KEYS}
-missing_feature_cols = need_cols - set(grid_pd.columns)
-if missing_feature_cols:
-    raise ValueError(f"grid_pd missing feature columns for GMM: {sorted(missing_feature_cols)}")
+seg_valid = seg_input.loc[valid].reset_index().rename(columns={"index": "_orig_idx"}).copy()
+X = X_all[valid]
 
-# ---------------------------------------------------------------------------
-# Feature matrix construction
-# 特征矩阵构建
-# ---------------------------------------------------------------------------
-feature_values = {}
-for k in GMM_FEATURE_KEYS:
-    _, fn = feature_defs[k]
-    feature_values[k] = fn(grid_pd)
+conf = seg_valid["confidence_weight"].to_numpy(np.float32) if "confidence_weight" in seg_valid.columns else np.ones(len(seg_valid), np.float32)
+conf = np.clip(np.nan_to_num(conf, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0)
 
-X = np.column_stack([feature_values[k] for k in GMM_FEATURE_KEYS]).astype(float)
+Xs = StandardScaler().fit_transform(X).astype(np.float32, copy=False)
 
-valid = np.all(np.isfinite(X), axis=1)
-if int(valid.sum()) == 0:
-    raise ValueError("No valid rows for GMM after filtering non-finite feature values")
+# ----------------------------
+# Optional numba acceleration
+# ----------------------------
+try:
+    from numba import njit
+    NUMBA_OK = True
+except Exception:
+    NUMBA_OK = False
+    print("Numba not available, falling back to python.")
 
-X_valid = X[valid, :]
+# ----------------------------
+# Build edges (vectorized, no dict loop)
+# ----------------------------
+def build_grid_edges_vectorized(bin_xy, connectivity=8):
+    """
+    bin_xy: (n,2) int (x_bin,y_bin) for VALID points only.
+    Returns ei, ej arrays with i<j, undirected edges.
+    Uses a dense 2D index map on [xmin..xmax] x [ymin..ymax].
+    """
+    bx = bin_xy[:, 0].astype(np.int32)
+    by = bin_xy[:, 1].astype(np.int32)
+    xmin, xmax = int(bx.min()), int(bx.max())
+    ymin, ymax = int(by.min()), int(by.max())
+    W = (xmax - xmin + 1)
+    H = (ymax - ymin + 1)
 
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_valid)
+    # 2D map: index in [0..n-1], else -1
+    idx_map = -np.ones((W, H), dtype=np.int32)
+    ix = (bx - xmin).astype(np.int32)
+    iy = (by - ymin).astype(np.int32)
+    idx_map[ix, iy] = np.arange(len(bin_xy), dtype=np.int32)
 
-print(f"Running GMM (k={N_COMPONENTS}) on features: {', '.join(GMM_FEATURE_KEYS)}")
+    if connectivity == 4:
+        offs = [(1, 0), (0, 1)]
+    else:
+        offs = [(1, 0), (0, 1), (1, 1), (1, -1)]
+
+    ei_list = []
+    ej_list = []
+    for dx, dy in offs:
+        x2 = ix + dx
+        y2 = iy + dy
+        m = (x2 >= 0) & (x2 < W) & (y2 >= 0) & (y2 < H)
+        if not np.any(m):
+            continue
+        j = idx_map[x2[m], y2[m]]
+        m2 = j >= 0
+        if not np.any(m2):
+            continue
+        i = np.where(m)[0][m2].astype(np.int32)
+        j = j[m2].astype(np.int32)
+        # ensure i<j
+        swap = i > j
+        if np.any(swap):
+            ii = i.copy()
+            i[swap] = j[swap]
+            j[swap] = ii[swap]
+        ei_list.append(i)
+        ej_list.append(j)
+
+    if not ei_list:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    ei = np.concatenate(ei_list).astype(np.int32)
+    ej = np.concatenate(ej_list).astype(np.int32)
+
+    # unique edges (optional; can contain duplicates from swaps)
+    # Use structured view for fast unique
+    edges = np.stack([ei, ej], axis=1)
+    edges = np.unique(edges, axis=0)
+    return edges[:, 0].astype(np.int32), edges[:, 1].astype(np.int32)
+
+bin_xy = seg_valid[["x_bin", "y_bin"]].to_numpy(int)
+ei, ej = build_grid_edges_vectorized(bin_xy, connectivity=EDGE_CONNECTIVITY)
+
+# ----------------------------
+# Edge weights from feature distance
+# ----------------------------
+def compute_edge_weights(X_feat, ei, ej):
+    if len(ei) == 0:
+        return np.array([], dtype=np.float32), 1.0
+    d = np.linalg.norm(X_feat[ei] - X_feat[ej], axis=1)
+    dpos = d[d > 0]
+    tau = float(np.median(dpos)) if dpos.size else 1.0
+    tau = max(tau, 1e-6)
+    w = np.exp(-(d * d) / (tau * tau)).astype(np.float32)
+    return w, tau
+
+w_ij, tau = compute_edge_weights(Xs, ei, ej)
+
+# ----------------------------
+# CSR neighbors
+# ----------------------------
+def edges_to_csr(n, ei, ej, w):
+    deg = np.zeros(n, dtype=np.int32)
+    np.add.at(deg, ei, 1)
+    np.add.at(deg, ej, 1)
+    indptr = np.zeros(n + 1, dtype=np.int32)
+    indptr[1:] = np.cumsum(deg, dtype=np.int64).astype(np.int32)
+    indices = np.empty(indptr[-1], dtype=np.int32)
+    weights = np.empty(indptr[-1], dtype=np.float32)
+    cur = indptr[:-1].copy()
+
+    for a, b, ww in zip(ei.tolist(), ej.tolist(), w.tolist()):
+        pa = cur[a]
+        indices[pa] = b
+        weights[pa] = ww
+        cur[a] += 1
+
+        pb = cur[b]
+        indices[pb] = a
+        weights[pb] = ww
+        cur[b] += 1
+
+    return indptr, indices, weights
+
+n = len(seg_valid)
+indptr, indices, weights = edges_to_csr(n, ei, ej, w_ij)
+
+# ----------------------------
+# Energies / solver
+# ----------------------------
+def compute_total_energy(lbl, Dp, ei, ej, w, lam):
+    data = float(np.sum(Dp[np.arange(len(lbl)), lbl]))
+    if len(ei) == 0:
+        return data, 0.0, data
+    smooth = float(lam * np.sum(w[lbl[ei] != lbl[ej]]))
+    return data, smooth, data + smooth
+
+def compute_total_energy_csr(lbl, Dp, indptr, indices, weights, lam):
+    data = float(np.sum(Dp[np.arange(len(lbl)), lbl]))
+    smooth_raw = 0.0
+    n = len(lbl)
+    for i in range(n):
+        li = int(lbl[i])
+        a = int(indptr[i])
+        b = int(indptr[i + 1])
+        for p in range(a, b):
+            j = int(indices[p])
+            if j <= i:
+                continue
+            if li != int(lbl[j]):
+                smooth_raw += float(weights[p])
+    smooth = float(lam) * smooth_raw
+    return data, smooth, data + smooth
+
+if NUMBA_OK:
+    @njit(cache=True, fastmath=True)
+    def icm_optimize_csr(init_lbl, Dp, indptr, indices, weights, lam, max_iter, seed):
+        np.random.seed(seed)
+        lbl = init_lbl.copy()
+        n, k = Dp.shape
+        order = np.arange(n)
+        for _ in range(max_iter):
+            np.random.shuffle(order)
+            changed = 0
+            for t in range(n):
+                i = order[t]
+                a = indptr[i]
+                b = indptr[i + 1]
+                if b <= a:
+                    continue
+                pen = np.zeros(k, np.float32)
+                for p in range(a, b):
+                    j = indices[p]
+                    w = weights[p]
+                    lj = lbl[j]
+                    # Potts: +w for all labels, -w for neighbor label
+                    for c in range(k):
+                        pen[c] += w
+                    pen[lj] -= w
+                # choose best label
+                best = 0
+                bestv = Dp[i, 0] + lam * pen[0]
+                for c in range(1, k):
+                    v = Dp[i, c] + lam * pen[c]
+                    if v < bestv:
+                        bestv = v
+                        best = c
+                if best != lbl[i]:
+                    lbl[i] = best
+                    changed += 1
+            if changed == 0:
+                break
+        return lbl
+
+    def icm_multistart(Dp, indptr, indices, weights, lam, restarts, max_iter, seed, init_labels=None):
+        rng = np.random.default_rng(seed)
+        n, k = Dp.shape
+        best_lbl = None
+        best_e = np.inf
+        for r in range(max(1, int(restarts))):
+            if r == 0 and init_labels is not None:
+                init = init_labels.astype(np.int32, copy=True)
+            else:
+                init = rng.integers(0, k, size=n, endpoint=False, dtype=np.int32)
+            lbl = icm_optimize_csr(init, Dp, indptr, indices, weights, float(lam), int(max_iter), int(seed + 100 + r))
+            _, _, e = compute_total_energy_csr(lbl, Dp, indptr, indices, weights, float(lam))
+            if e < best_e:
+                best_e = e
+                best_lbl = lbl.copy()
+        return best_lbl.astype(int), float(best_e)
+else:
+    def icm_multistart(Dp, indptr, indices, weights, lam, restarts, max_iter, seed, init_labels=None):
+        rng = np.random.default_rng(seed)
+        n, k = Dp.shape
+        best_lbl = None
+        best_e = np.inf
+        for r in range(max(1, int(restarts))):
+            if r == 0 and init_labels is not None:
+                lbl = init_labels.copy().astype(int)
+            else:
+                lbl = rng.integers(0, k, size=n, endpoint=False).astype(int)
+            for _ in range(int(max_iter)):
+                changed = 0
+                for i in rng.permutation(n):
+                    a = int(indptr[i])
+                    b = int(indptr[i + 1])
+                    if b <= a:
+                        continue
+                    pen = np.zeros(k, np.float32)
+                    for p in range(a, b):
+                        j = int(indices[p])
+                        ww = float(weights[p])
+                        pen += ww
+                        pen[int(lbl[j])] -= ww
+                    new = int(np.argmin(Dp[i] + float(lam) * pen))
+                    if new != int(lbl[i]):
+                        lbl[i] = new
+                        changed += 1
+                if changed == 0:
+                    break
+            _, _, e = compute_total_energy_csr(lbl, Dp, indptr, indices, weights, float(lam))
+            if e < best_e:
+                best_e = e
+                best_lbl = lbl.copy()
+        return best_lbl.astype(int), float(best_e)
+
+def try_alpha_expansion(Dp, ei, ej, w, lam):
+    try:
+        import pygco  # type: ignore
+        n, k = Dp.shape
+        unary = np.ascontiguousarray(np.round(Dp * 1000).astype(np.int32))
+        pair = np.ones((k, k), dtype=np.int32)
+        np.fill_diagonal(pair, 0)
+        edges = np.column_stack([ei, ej]).astype(np.int32)
+        ew = np.maximum(1, np.round(lam * w * 1000).astype(np.int32))
+        lbl = pygco.cut_general_graph(edges, ew, unary, pair, algorithm="expansion")
+        return np.asarray(lbl, dtype=int)
+    except Exception:
+        return None
+        print("pygco not available, falling back to ICM")
+
+def run_mrf_solver(Dp, indptr, indices, weights, ei, ej, w_ij, lam, mode, restarts, max_iter, seed, init_labels):
+    used = "icm"
+    lbl = None
+    if mode == "alpha_expansion":
+        lbl = try_alpha_expansion(Dp, ei, ej, w_ij, float(lam))
+        if lbl is not None:
+            used = "alpha_expansion"
+    if lbl is None:
+        lbl, _ = icm_multistart(Dp, indptr, indices, weights, float(lam), restarts, max_iter, seed, init_labels)
+        used = "icm_numba" if NUMBA_OK else "icm_python"
+    return lbl.astype(int), used
+
+def boundary_ratio(lbl, ei, ej, w):
+    if len(ei) == 0:
+        return 0.0
+    return float(np.sum(w[lbl[ei] != lbl[ej]]) / max(np.sum(w), 1e-12))
+
+def conditional_pseudolikelihood_subsample(lbl, Dp, indptr, indices, weights, lam, seed, n_eval=60000):
+    rng = np.random.default_rng(seed)
+    n, k = Dp.shape
+    take = min(int(n_eval), n)
+    idx = np.sort(rng.choice(n, size=take, replace=False))
+    tot = 0.0
+    for i in idx.tolist():
+        a = int(indptr[i])
+        b = int(indptr[i + 1])
+        e = Dp[i].astype(np.float32).copy()
+        if b > a:
+            pen = np.zeros(k, np.float32)
+            for p in range(a, b):
+                j = int(indices[p])
+                ww = float(weights[p])
+                pen += ww
+                pen[int(lbl[j])] -= ww
+            e = e + float(lam) * pen
+        # log softmax at lbl[i]
+        m = float(np.max(-e))
+        lse = m + float(np.log(np.sum(np.exp(-e - m))))
+        tot += (-float(e[int(lbl[i])]) - lse)
+    return float(tot / max(take, 1))
+
+def evaluate_lambda_stability_light(Dp, indptr, indices, weights, ei, ej, w_ij, lam, repeats, frac, seed, init_labels):
+    # light version: fewer restarts/iters inside, and compare on overlaps only
+    n, k = Dp.shape
+    if n < max(300, 5 * k) or repeats < 2:
+        return np.nan
+    rng = np.random.default_rng(seed)
+    runs = []
+    take = min(n, max(int(frac * n), max(5 * k, 300)))
+    for r in range(int(repeats)):
+        idx = np.sort(rng.choice(n, size=take, replace=False))
+        # remap to subgraph CSR
+        keep = np.zeros(n, dtype=bool)
+        keep[idx] = True
+        em = keep[ei] & keep[ej]
+        if int(em.sum()) < max(200, 5 * k):
+            continue
+        rem = np.full(n, -1, dtype=np.int32)
+        rem[idx] = np.arange(len(idx), dtype=np.int32)
+        sei = rem[ei[em]]
+        sej = rem[ej[em]]
+        sw = w_ij[em]
+        sindptr, sindices, sweights = edges_to_csr(len(idx), sei.astype(int), sej.astype(int), sw.astype(np.float32))
+        sub_init = init_labels[idx].astype(int, copy=True)
+        sub_lbl, _ = icm_multistart(Dp[idx], sindptr, sindices, sweights, float(lam),
+                                   restarts=max(2, ICM_RESTARTS // 3),
+                                   max_iter=max(8, ICM_MAX_ITER // 2),
+                                   seed=int(seed + 1000 + r),
+                                   init_labels=sub_init)
+        runs.append((idx, sub_lbl))
+    if len(runs) < 2:
+        return np.nan
+    aris = []
+    for i in range(len(runs)):
+        ia, la = runs[i]
+        for j in range(i + 1, len(runs)):
+            ib, lb = runs[j]
+            common, a, b = np.intersect1d(ia, ib, return_indices=True)
+            if common.size >= max(200, 5 * k):
+                aris.append(adjusted_rand_score(la[a], lb[b]))
+    return float(np.mean(aris)) if aris else np.nan
+
+# ----------------------------
+# GMM utilities
+# ----------------------------
+def fit_gmm_for_k(X, k, seed, cov_type):
+    g = GaussianMixture(
+        n_components=int(k),
+        covariance_type=str(cov_type),
+        reg_covar=1e-6,
+        random_state=int(seed),
+    )
+    g.fit(X)
+    resp = g.predict_proba(X).astype(np.float32, copy=False)
+    bic = float(g.bic(X))
+    ent = float(-np.sum(resp * np.log(resp + 1e-12)))
+    icl = float(bic + 2.0 * ent)
+    return g, resp, bic, icl
+
+def estimate_k_stability_fast(X, k, nbt, frac, seed, cov_type, eval_n=120000):
+    n = X.shape[0]
+    if nbt < 2:
+        return np.nan
+    rng = np.random.default_rng(seed + int(k) * 31)
+
+    eval_take = min(n, int(eval_n))
+    eval_idx = np.sort(rng.choice(n, size=eval_take, replace=False))
+
+    take = min(n, max(int(frac * n), max(8 * k, 800)))
+    preds = []
+    for b in range(int(nbt)):
+        idx = np.sort(rng.choice(n, size=take, replace=False))
+        g = GaussianMixture(
+            n_components=int(k),
+            covariance_type=str(cov_type),
+            reg_covar=1e-6,
+            random_state=int(seed + 1000 + b),
+        )
+        g.fit(X[idx])
+        preds.append(g.predict(X[eval_idx]))
+
+    a = []
+    for i in range(len(preds)):
+        for j in range(i + 1, len(preds)):
+            a.append(adjusted_rand_score(preds[i], preds[j]))
+    return float(np.mean(a)) if a else np.nan
+
+# ----------------------------
+# Select K
+# ----------------------------
+krows = []
+for k in sorted(set(K_RANGE)):
+    if k < 2 or k >= len(seg_valid):
+        continue
+    _, _, bic, icl = fit_gmm_for_k(Xs, k, RANDOM_SEED + k, GMM_COV)
+    st = estimate_k_stability_fast(Xs, k, K_SELECTION_BOOTSTRAPS, K_SELECTION_SUBSAMPLE_FRAC,
+                                   RANDOM_SEED, GMM_COV, eval_n=EVAL_N)
+    krows.append({"k": int(k), "bic": bic, "icl": icl, "stability": st if np.isfinite(st) else np.nan})
+
+if not krows:
+    raise ValueError("No K candidate.")
+
+k_eval_df = pd.DataFrame(krows).sort_values("k").reset_index(drop=True)
+cand = k_eval_df[k_eval_df["stability"] >= K_STABILITY_MIN]
+selected_k = int(
+    cand.sort_values(["icl", "k"]).iloc[0]["k"]
+    if not cand.empty
+    else k_eval_df.sort_values(["stability", "k"], ascending=[False, True]).iloc[0]["k"]
+)
+N_COMPONENTS = int(selected_k)
+
+# ----------------------------
+# Fit final GMM, build data term Dp
+# ----------------------------
 gmm = GaussianMixture(
     n_components=int(N_COMPONENTS),
-    random_state=int(RANDOM_SEED),
-    covariance_type="full",
+    covariance_type=str(GMM_COV),
+    reg_covar=1e-6,
+    random_state=RANDOM_SEED,
 )
-labels_raw = np.full(len(grid_pd), fill_value=-1, dtype=int)
-labels_raw[valid] = gmm.fit_predict(X_scaled)
-grid_pd["cluster_id_raw"] = labels_raw
+gmm.fit(Xs)
+resp = gmm.predict_proba(Xs).astype(np.float32, copy=False)
 
-# Keep only rows used in clustering for downstream region labeling.
-# 仅对参与聚类的行进行后续区域标注。
-clustered = grid_pd.loc[grid_pd["cluster_id_raw"] >= 0].copy()
-if clustered.empty:
-    raise ValueError("No clustered rows available for region labeling")
+D = (-np.log(resp + 1e-12)).astype(np.float32, copy=False)
+# Confidence-weighted data term; low-conf -> use per-row mean (so it doesn't force a label)
+Dp = (conf[:, None] * D + (1.0 - conf[:, None]) * D.mean(axis=1, keepdims=True)).astype(np.float32, copy=False)
+raw = np.argmin(Dp, axis=1).astype(int)
 
-# Sort clusters by transcript_count median to get stable ordering.
-# 按 transcript_count 的中位数对簇排序，以获得稳定编号。
-rank = clustered.groupby("cluster_id_raw")["transcript_count"].median().sort_values()
-map_id = {int(old): int(new) for new, old in enumerate(rank.index)}
+# Lambda grid
+srt = np.sort(Dp, axis=1)
+marg = (srt[:, 1] - srt[:, 0]) if srt.shape[1] >= 2 else np.ones(len(srt), np.float32)
+marg = marg[np.isfinite(marg) & (marg > 0)]
+lambda0 = max(float(np.median(marg)) if marg.size else 1.0, 1e-6)
 
-grid_pd["cluster_sorted"] = (
-    grid_pd["cluster_id_raw"].map(lambda v: map_id.get(int(v), -1) if v >= 0 else -1).astype(int)
-)
-grid_pd["region"] = np.where(
-    grid_pd["cluster_sorted"] >= 0,
-    "Cluster " + grid_pd["cluster_sorted"].astype(str),
-    "Unassigned",
-)
+if LAMBDA_GRID_CFG is None:
+    lambda_grid = np.unique(np.round(lambda0 * np.array([0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]), 8))
+else:
+    lambda_grid = np.unique(np.asarray(LAMBDA_GRID_CFG, np.float32))
+lambda_grid = lambda_grid[np.isfinite(lambda_grid) & (lambda_grid > 0)]
+if lambda_grid.size == 0:
+    lambda_grid = np.array([lambda0], np.float32)
 
-# ---------------------------------------------------------------------------
-# Color palettes and compare context
-# 配色与对比上下文
-# ---------------------------------------------------------------------------
-cmap = cm.get_cmap("tab10", int(N_COMPONENTS))
-GMM_CLUSTER_PALETTE = {i: ("lightgray" if i == 0 else cmap(i)) for i in range(int(N_COMPONENTS))}
-GMM_REGION_PALETTE = {f"Cluster {i}": c for i, c in GMM_CLUSTER_PALETTE.items()}
+# ----------------------------
+# Evaluate lambdas (fast path)
+# ----------------------------
+lrows = []
+tmp_results = []
+for lam in lambda_grid.tolist():
+    lbl, used = run_mrf_solver(Dp, indptr, indices, weights, ei, ej, w_ij,
+                               float(lam), MRF_SOLVER, ICM_RESTARTS, ICM_MAX_ITER,
+                               RANDOM_SEED + int(round(lam * 1000)), raw)
+    br = boundary_ratio(lbl, ei, ej, w_ij)
+    pl = conditional_pseudolikelihood_subsample(lbl, Dp, indptr, indices, weights, float(lam),
+                                               seed=RANDOM_SEED + 71 + int(round(lam * 1000)),
+                                               n_eval=60000)
+    # objective placeholder; stability computed only for top-N if needed
+    lrows.append({
+        "lambda": float(lam),
+        "boundary_ratio": float(br),
+        "stability": np.nan,
+        "pseudo_likelihood": float(pl),
+        "objective": np.nan,
+        "solver_used": str(used),
+    })
+    tmp_results.append((float(lam), lbl, used))
 
-valid_clusters = sorted([c for c in grid_pd["cluster_sorted"].unique().tolist() if int(c) >= 0])
+lambda_eval_df = pd.DataFrame(lrows).sort_values("lambda").reset_index(drop=True)
+
+if LAMBDA_MODE == "manual" and LAMBDA_MANUAL is not None:
+    selected_lambda = float(LAMBDA_MANUAL)
+else:
+    # choose candidate set for stability if requested
+    if LAMBDA_MODE == "pseudolikelihood":
+        selected_lambda = float(lambda_eval_df.sort_values(["pseudo_likelihood", "lambda"], ascending=[False, True]).iloc[0]["lambda"])
+    else:
+        # stability mode: compute stability only on best few by boundary_ratio (prefer smoother) + pseudolikelihood (prefer fit)
+        # heuristic pre-ranking: maximize (pseudo_likelihood - 0.10*boundary_ratio)
+        pre = lambda_eval_df.copy()
+        pre["pre_obj"] = pre["pseudo_likelihood"] - 0.10 * pre["boundary_ratio"]
+        top = pre.sort_values(["pre_obj", "lambda"], ascending=[False, True]).head(max(1, int(LAMBDA_STABILITY_TOPN)))
+        stab_map = {}
+        for lam in top["lambda"].tolist():
+            st = evaluate_lambda_stability_light(Dp, indptr, indices, weights, ei, ej, w_ij,
+                                                 float(lam),
+                                                 repeats=int(LAMBDA_STABILITY_REPEATS),
+                                                 frac=float(LAMBDA_STABILITY_SUBSAMPLE_FRAC),
+                                                 seed=RANDOM_SEED + 9000 + int(round(lam * 1000)),
+                                                 init_labels=raw)
+            stab_map[float(lam)] = st
+
+        lambda_eval_df["stability"] = lambda_eval_df["lambda"].map(stab_map).astype(np.float32)
+        # final objective: stability - 0.1*boundary_ratio (same as you had)
+        lambda_eval_df["objective"] = lambda_eval_df["stability"] - 0.10 * lambda_eval_df["boundary_ratio"]
+        vo = lambda_eval_df[np.isfinite(lambda_eval_df["objective"])]
+        selected_lambda = float(
+            vo.sort_values(["objective", "lambda"], ascending=[False, True]).iloc[0]["lambda"]
+            if not vo.empty
+            else pre.sort_values(["pre_obj", "lambda"], ascending=[False, True]).iloc[0]["lambda"]
+        )
+
+# ----------------------------
+# Final solve at selected lambda
+# ----------------------------
+labels, solver_final = run_mrf_solver(Dp, indptr, indices, weights, ei, ej, w_ij,
+                                      float(selected_lambda), MRF_SOLVER,
+                                      ICM_RESTARTS, ICM_MAX_ITER,
+                                      RANDOM_SEED + 999, raw)
+
+# ----------------------------
+# Sorting labels by transcript_count (as in your code)
+# ----------------------------
+def sort_map(lbl, c):
+    r = pd.DataFrame({"l": lbl, "c": c}).groupby("l")["c"].median().sort_values()
+    return {int(old): int(new) for new, old in enumerate(r.index.tolist())}
+
+map_raw = sort_map(raw, seg_valid["transcript_count"].to_numpy(np.float32))
+map_s = sort_map(labels, seg_valid["transcript_count"].to_numpy(np.float32))
+raw_s = np.array([map_raw[int(v)] for v in raw], int)
+sm = np.array([map_s[int(v)] for v in labels], int)
+
+# energies / confidence
+de = Dp[np.arange(n), labels]
+se = np.zeros(n, np.float32)
+if len(ei):
+    diff = labels[ei] != labels[ej]
+    ep = float(selected_lambda) * w_ij * diff.astype(np.float32)
+    np.add.at(se, ei, 0.5 * ep)
+    np.add.at(se, ej, 0.5 * ep)
+
+conf_lbl = resp.max(axis=1) * conf
+
+# write back to full grid_pd
+full = len(seg_input)
+raw_full = np.full(full, -1, int)
+sm_full = np.full(full, -1, int)
+de_full = np.full(full, np.nan, float)
+se_full = np.full(full, np.nan, float)
+cf_full = np.full(full, np.nan, float)
+ix = np.where(valid)[0]
+raw_full[ix] = raw_s
+sm_full[ix] = sm
+de_full[ix] = de
+se_full[ix] = se
+cf_full[ix] = conf_lbl
+
+grid_pd["cluster_id_raw"] = raw_full
+grid_pd["cluster_sorted"] = sm_full
+grid_pd["region"] = np.where(sm_full >= 0, "Cluster " + sm_full.astype(str), "Unassigned")
+grid_pd["label_raw"] = raw_full
+grid_pd["label_smooth"] = sm_full
+grid_pd["data_energy"] = de_full
+grid_pd["smooth_energy"] = se_full
+grid_pd["total_energy"] = de_full + se_full
+grid_pd["label_confidence"] = cf_full
+
+seg_df = grid_pd[["x_bin", "y_bin", "label_raw", "label_smooth", "data_energy", "smooth_energy", "total_energy", "label_confidence"]].copy()
+
+valid_clusters = sorted([int(c) for c in np.unique(sm_full) if int(c) >= 0])
 if len(valid_clusters) < 2:
-    raise ValueError("Need at least two clusters for compare context")
+    raise ValueError("Need >=2 clusters.")
 
+COMPARE_CLUSTER_A = int(globals().get("COMPARE_CLUSTER_A", valid_clusters[-2]))
+COMPARE_CLUSTER_B = int(globals().get("COMPARE_CLUSTER_B", valid_clusters[-1]))
 if COMPARE_CLUSTER_A not in valid_clusters:
     COMPARE_CLUSTER_A = valid_clusters[-2]
 if COMPARE_CLUSTER_B not in valid_clusters:
     COMPARE_CLUSTER_B = valid_clusters[-1]
 
-COMPARE_COLOR_A = GMM_CLUSTER_PALETTE[int(COMPARE_CLUSTER_A)]
-COMPARE_COLOR_B = GMM_CLUSTER_PALETTE[int(COMPARE_CLUSTER_B)]
-COMPARE_CMAP_AB = LinearSegmentedColormap.from_list(
-    "compare_ab",
-    [COMPARE_COLOR_B, "#f7f7f7", COMPARE_COLOR_A],
-)
+cm10 = cm.get_cmap("tab10", max(valid_clusters) + 1)
+GMM_CLUSTER_PALETTE = {i: cm10(i) for i in valid_clusters}
+GMM_REGION_PALETTE = {f"Cluster {i}": GMM_CLUSTER_PALETTE[i] for i in valid_clusters}
+
+COMPARE_COLOR_A = GMM_CLUSTER_PALETTE[COMPARE_CLUSTER_A]
+COMPARE_COLOR_B = GMM_CLUSTER_PALETTE[COMPARE_CLUSTER_B]
+COMPARE_CMAP_AB = LinearSegmentedColormap.from_list("compare_ab", [COMPARE_COLOR_B, "#f7f7f7", COMPARE_COLOR_A])
 
 def get_compare_context():
-    """
-    Return naming and color configuration for a selected compare pair.
-    返回所选对比簇的命名与配色配置。
-    """
     a, b = int(COMPARE_CLUSTER_A), int(COMPARE_CLUSTER_B)
     return {
         "cluster_a": a,
@@ -767,135 +1780,330 @@ def get_compare_context():
         "palette_cluster": GMM_CLUSTER_PALETTE,
         "palette_region": GMM_REGION_PALETTE,
         "cmap_ab": COMPARE_CMAP_AB,
-        "gmm_feature_keys": tuple(GMM_FEATURE_KEYS),
+        "gmm_feature_keys": tuple(feature_cols),
+        "selected_k": int(N_COMPONENTS),
+        "selected_lambda": float(selected_lambda),
+        "gmm_covariance_type": str(GMM_COV),
+        "numba_ok": bool(NUMBA_OK),
     }
 
 COMPARE_CONTEXT = get_compare_context()
 target_grids = grid_pd.copy()
+CLASSIFICATION_FEATURE_COLUMNS = tuple(feature_cols)
+CLASSIFICATION_GEOMETRY_ONLY = True
 
-# ---------------------------------------------------------------------------
-# Statistics summary
-# 统计汇总
-# ---------------------------------------------------------------------------
-summary_cols = ["transcript_count", z_std_col]
-if "z_entropy" in grid_pd.columns:
-    summary_cols.append("z_entropy")
+print("=" * 74)
+print("Geometry-only segmentation summary (FAST)")
+print("=" * 74)
+print(f"Valid points: {len(seg_valid):,}")
+print(f"Feature count: {len(feature_cols)}")
+print(f"GMM covariance_type: {GMM_COV}")
+print(f"Selected K: {N_COMPONENTS}")
+print(f"Lambda mode: {LAMBDA_MODE}")
+print(f"Selected lambda: {selected_lambda:.6g}")
+print(f"Solver used: {solver_final}")
+print(f"Edge count: {len(ei):,}")
+print(f"Connectivity: {EDGE_CONNECTIVITY}")
+print(f"Tau: {tau:.6g}")
+print(f"K stability eval subset: {min(EVAL_N, len(seg_valid)):,}")
+print(f"Numba ICM enabled: {NUMBA_OK}")
+print(f"Compare clusters: {COMPARE_CLUSTER_A} vs {COMPARE_CLUSTER_B}")
+print("=" * 74)
 
-stats_df = (
-    grid_pd.loc[grid_pd["cluster_sorted"] >= 0]
-    .groupby("region")[summary_cols]
-    .median()
-)
+# Plot raw vs smoothed
+fig, ax = plt.subplots(1, 2, figsize=(18, 7))
+for c in valid_clusters:
+    s = seg_valid.loc[raw_s == c]
+    ax[0].scatter(s["x_um"], s["y_um"], s=2, alpha=0.8, edgecolors="none",
+                  c=[GMM_CLUSTER_PALETTE[c]], label=f"Cluster {c}", rasterized=True)
+for c in valid_clusters:
+    s = seg_valid.loc[sm == c]
+    ax[1].scatter(s["x_um"], s["y_um"], s=2, alpha=0.8, edgecolors="none",
+                  c=[GMM_CLUSTER_PALETTE[c]], label=f"Cluster {c}", rasterized=True)
 
-print("=" * 60)
-print(f"GMM clustering completed: k={N_COMPONENTS}")
-print(f"Features: {', '.join(GMM_FEATURE_KEYS)}")
-print("-" * 60)
-print("Cluster medians:")
-print(stats_df)
-print("=" * 60)
+ax[0].set_title(f"Raw labels (K={N_COMPONENTS})")
+ax[1].set_title(f"Smoothed labels (lambda={selected_lambda:.3g})")
+for a in ax:
+    a.set_aspect("equal")
+    a.invert_yaxis()
+    a.set_xticks([])
+    a.set_yticks([])
+    a.legend(loc="lower right", frameon=True, fontsize=9)
 
-# ---------------------------------------------------------------------------
-# Visualization
-# 可视化
-# ---------------------------------------------------------------------------
-fig, (ax0, ax1) = plt.subplots(
-    1,
-    2,
-    figsize=(22, 9),
-    gridspec_kw={"width_ratios": [1.5, 1]},
-)
+plt.tight_layout()
+plt.show()
 
-labels = [f"Cluster {i}" for i in valid_clusters]
 
-for lab in labels:
-    sub = grid_pd[grid_pd["region"] == lab]
-    ax0.scatter(
-        sub[x_col],
-        sub[y_col],
-        s=2.5,
-        c=[GMM_REGION_PALETTE[lab]] * len(sub),
-        alpha=0.8,
-        edgecolors="none",
-        label=lab,
-        rasterized=True,
+# %%
+# ===========================================================================
+# Sigma x lambda sensitivity curves (geometry-only) - optimized
+#   - GMM covariance_type defaults to "diag" (fast)
+#   - Precompute bootstrap subgraphs + pairwise overlap indices ONCE per sigma
+#   - Lambda loop only runs solvers + ARI (no repeated subgraph extraction)
+# ===========================================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import adjusted_rand_score
+
+if "grid_pd" not in globals():
+    raise NameError("Missing grid_pd")
+if "SIGMA_LIST_UM" not in globals() or "N_COMPONENTS" not in globals():
+    raise NameError("Run clustering cell first")
+
+required_helpers = [
+    "build_grid_edges_vectorized",
+    "compute_edge_weights",
+    "edges_to_csr",
+    "icm_multistart",
+    "compute_total_energy",
+    "boundary_ratio",
+]
+missing_helpers = [name for name in required_helpers if name not in globals()]
+if missing_helpers:
+    raise NameError("Missing helper(s): " + ", ".join(missing_helpers) + ". Run clustering cell first.")
+
+RANDOM_SEED = int(globals().get("RANDOM_SEED", 412))
+EDGE_CONNECTIVITY = int(globals().get("EDGE_CONNECTIVITY", 8))
+ICM_RESTARTS = int(globals().get("ICM_RESTARTS", 6))
+ICM_MAX_ITER = int(globals().get("ICM_MAX_ITER", 25))
+
+# bootstrap/stability knobs for this sensitivity cell
+STAB_RUNS = int(globals().get("SENS_STAB_RUNS", 6))         # number of subsample runs per (sigma, lambda)
+STAB_FRAC = float(globals().get("SENS_STAB_FRAC", 0.80))    # subsample fraction
+STAB_MIN_COMMON = int(globals().get("SENS_STAB_MIN_COMMON", 200))
+
+# GMM covariance (fast default)
+GMM_COV_SENS = str(globals().get("GMM_COV_SENS", globals().get("GMM_COVARIANCE_TYPE", "diag"))).lower()
+if GMM_COV_SENS not in {"diag", "full", "tied", "spherical"}:
+    GMM_COV_SENS = "diag"
+
+sigma_list = [int(float(s)) for s in sorted(SIGMA_LIST_UM)]
+if "lambda_eval_df" in globals() and isinstance(lambda_eval_df, pd.DataFrame) and (not lambda_eval_df.empty):
+    lambda_grid = np.sort(lambda_eval_df["lambda"].astype(np.float32).unique())
+else:
+    lambda_grid = np.array([0.25, 0.5, 0.75, 1.0, 1.5, 2.0], dtype=np.float32)
+
+rows = []
+
+for sigma in sigma_list:
+    cols = [f"rho_sigma_s{sigma}", f"z_std_all_sigma_s{sigma}", f"z_std_diff_enhanced_s{sigma}"]
+    if any(c not in grid_pd.columns for c in cols):
+        continue
+
+    work = grid_pd[["x_bin", "y_bin", "confidence_weight"] + cols].dropna(subset=cols).reset_index(drop=True)
+    if len(work) < max(200, 20 * int(N_COMPONENTS)):
+        continue
+
+    X = work[cols].to_numpy(np.float32)
+    conf = np.clip(work["confidence_weight"].to_numpy(np.float32), 0.0, 1.0)
+    X_scaled = StandardScaler().fit_transform(X).astype(np.float32, copy=False)
+
+    # ----- GMM (once per sigma) -----
+    gmm = GaussianMixture(
+        n_components=int(N_COMPONENTS),
+        covariance_type=str(GMM_COV_SENS),
+        reg_covar=1e-6,
+        random_state=RANDOM_SEED + int(sigma),
     )
+    gmm.fit(X_scaled)
+    resp = gmm.predict_proba(X_scaled).astype(np.float32, copy=False)
 
-ax0.set_title(
-    f"GMM clustering (k={N_COMPONENTS})\nFeatures: {', '.join(GMM_FEATURE_KEYS)}",
-    fontsize=16,
-    fontweight="bold",
-)
-ax0.set_xlabel("X location (um)")
-ax0.set_ylabel("Y location (um)")
-if grid_pd[y_col].max() > 0:
-    ax0.invert_yaxis()
-ax0.legend(markerscale=5, loc="lower right", fontsize=12, frameon=True)
-ax0.set_aspect("equal")
+    D = (-np.log(resp + 1e-12)).astype(np.float32, copy=False)
+    Dp = (conf[:, None] * D + (1.0 - conf[:, None]) * D.mean(axis=1, keepdims=True)).astype(np.float32, copy=False)
+    raw = np.argmin(Dp, axis=1).astype(np.int32, copy=False)
 
-# Feature-space plot: use the first two selected features for axes.
-# 特征空间作图：使用所选特征的前两个作为坐标轴。
-if len(GMM_FEATURE_KEYS) >= 2:
-    plot_df = grid_pd.loc[grid_pd["cluster_sorted"] >= 0].sample(
-        n=min(20000, int((grid_pd["cluster_sorted"] >= 0).sum())),
-        random_state=42,
-    )
+    # ----- Graph build (once per sigma) -----
+    bxy = work[["x_bin", "y_bin"]].to_numpy(np.int32, copy=False)
+    ei, ej = build_grid_edges_vectorized(bxy, connectivity=int(EDGE_CONNECTIVITY))
+    w, _ = compute_edge_weights(X_scaled, ei, ej)
+    indptr, indices, weights = edges_to_csr(len(work), ei, ej, w)
 
-    xk, yk = GMM_FEATURE_KEYS[0], GMM_FEATURE_KEYS[1]
-    axis_map = {
-        "log_density": ("log1p transcript_count", np.log1p(plot_df["transcript_count"].to_numpy(float))),
-        "z_std": (z_std_col, plot_df[z_std_col].to_numpy(float)),
-        "z_entropy": ("z_entropy", plot_df["z_entropy"].to_numpy(float)),
-    }
+    # ----- Precompute subsamples/subgraphs ONCE per sigma -----
+    rng = np.random.default_rng(RANDOM_SEED + 10_000 + int(sigma))
+    n = len(work)
+    take = min(n, max(int(STAB_FRAC * n), max(5 * int(N_COMPONENTS), 300)))
 
-    x_label, x_val = axis_map[xk]
-    y_label, y_val = axis_map[yk]
-    plot_df = plot_df.copy()
-    plot_df["_x"] = x_val
-    plot_df["_y"] = y_val
+    subs = []
+    for r in range(int(STAB_RUNS)):
+        idx = np.sort(rng.choice(n, size=take, replace=False)).astype(np.int32, copy=False)
 
-    sns.scatterplot(
-        data=plot_df,
-        x="_x",
-        y="_y",
-        hue="region",
-        hue_order=labels,
-        palette=GMM_REGION_PALETTE,
-        s=15,
-        alpha=0.6,
-        ax=ax1,
-        legend=False,
-        edgecolor=None,
-    )
+        keep = np.zeros(n, dtype=bool)
+        keep[idx] = True
+        em = keep[ei] & keep[ej]
+        if int(em.sum()) < max(200, 5 * int(N_COMPONENTS)):
+            continue
 
-    cent = plot_df.groupby("region")[["_x", "_y"]].median()
-    for lab, row in cent.iterrows():
-        ax1.scatter(row["_x"], row["_y"], s=250, c="black", marker="X", zorder=10)
-        ax1.text(
-            row["_x"],
-            row["_y"],
-            lab,
-            ha="center",
-            fontsize=11,
-            fontweight="bold",
-            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.5),
+        rem = np.full(n, -1, dtype=np.int32)
+        rem[idx] = np.arange(len(idx), dtype=np.int32)
+
+        sei = rem[ei[em]]
+        sej = rem[ej[em]]
+        sw = w[em].astype(np.float32, copy=False)
+
+        sindptr, sindices, sweights = edges_to_csr(len(idx), sei.astype(int), sej.astype(int), sw)
+        subs.append(
+            {
+                "idx": idx,
+                "indptr": sindptr,
+                "indices": sindices,
+                "weights": sweights,
+                "raw_sub": raw[idx].astype(np.int32, copy=False),
+            }
         )
 
-    ax1.set_title(
-        f"Feature space (projection)\nAxes: {xk} vs {yk}",
-        fontsize=14,
-        fontweight="bold",
-    )
-    ax1.set_xlabel(x_label)
-    ax1.set_ylabel(y_label)
-    ax1.grid(True, linestyle="--", alpha=0.5, which="both")
-else:
-    ax1.axis("off")
+    # pairwise overlap indices cached (so we don't intersect every lambda)
+    overlap_pairs = []
+    for i in range(len(subs)):
+        ia = subs[i]["idx"]
+        for j in range(i + 1, len(subs)):
+            ib = subs[j]["idx"]
+            common, a, b = np.intersect1d(ia, ib, return_indices=True)
+            if int(common.size) >= int(STAB_MIN_COMMON):
+                overlap_pairs.append((i, j, a.astype(np.int32, copy=False), b.astype(np.int32, copy=False)))
+
+    # If subsampling failed (rare), we still compute energy/boundary and skip stability
+    have_stab = (len(subs) >= 2) and (len(overlap_pairs) >= 1)
+
+    # ----- Lambda loop (cheap: just solve, no more subgraph extraction) -----
+    for lam in lambda_grid.tolist():
+        lam = float(lam)
+
+        labels, _ = icm_multistart(
+            Dp, indptr, indices, weights,
+            lam,
+            max(3, ICM_RESTARTS // 2),
+            max(8, ICM_MAX_ITER // 2),
+            RANDOM_SEED + int(1000 * lam) + int(sigma),
+            init_labels=raw,
+        )
+
+        de, se, te = compute_total_energy(labels, Dp, ei, ej, w, lam)
+        br = boundary_ratio(labels, ei, ej, w)
+
+        st = np.nan
+        if have_stab:
+            sub_labels = []
+            for r, s in enumerate(subs):
+                lsub, _ = icm_multistart(
+                    Dp[s["idx"]],
+                    s["indptr"],
+                    s["indices"],
+                    s["weights"],
+                    lam,
+                    2,
+                    10,
+                    RANDOM_SEED + 20_000 + int(sigma) + int(1000 * lam) + int(r),
+                    init_labels=s["raw_sub"],
+                )
+                sub_labels.append(lsub.astype(np.int32, copy=False))
+
+            aris = []
+            for (i, j, a, b) in overlap_pairs:
+                aris.append(adjusted_rand_score(sub_labels[i][a], sub_labels[j][b]))
+            st = float(np.mean(aris)) if aris else np.nan
+
+        rows.append(
+            {
+                "sigma_um": int(sigma),
+                "lambda": float(lam),
+                "stability": st,
+                "boundary_ratio": float(br),
+                "data_energy": float(de),
+                "smooth_energy": float(se),
+                "total_energy": float(te),
+                "objective": float(st - 0.1 * br) if np.isfinite(st) else np.nan,
+                "gmm_cov": str(GMM_COV_SENS),
+                "n_points": int(n),
+                "n_edges": int(len(ei)),
+                "n_stab_runs": int(len(subs)),
+            }
+        )
+
+sigma_lambda_df = pd.DataFrame(rows)
+if sigma_lambda_df.empty:
+    raise ValueError("No sigma-lambda sensitivity results generated")
+
+print("=" * 70)
+print("Sigma x lambda sensitivity summary (optimized)")
+print("=" * 70)
+print(sigma_lambda_df.head(20).to_string(index=False))
+print("=" * 70)
+
+stab_mat = sigma_lambda_df.pivot(index="sigma_um", columns="lambda", values="stability")
+bnd_mat = sigma_lambda_df.pivot(index="sigma_um", columns="lambda", values="boundary_ratio")
+obj_mat = sigma_lambda_df.pivot(index="sigma_um", columns="lambda", values="objective")
+
+fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+sns.heatmap(stab_mat, cmap="viridis", ax=axes[0], cbar_kws={"label": "Stability (ARI)"})
+axes[0].set_title("Sigma x lambda stability")
+axes[0].set_xlabel("lambda")
+axes[0].set_ylabel("sigma (um)")
+
+sns.heatmap(bnd_mat, cmap="magma_r", ax=axes[1], cbar_kws={"label": "Boundary ratio"})
+axes[1].set_title("Sigma x lambda boundary ratio")
+axes[1].set_xlabel("lambda")
+axes[1].set_ylabel("")
+
+sns.heatmap(obj_mat, cmap="coolwarm", center=0, ax=axes[2], cbar_kws={"label": "Objective"})
+axes[2].set_title("Sigma x lambda objective")
+axes[2].set_xlabel("lambda")
+axes[2].set_ylabel("")
 
 plt.tight_layout()
 plt.show()
 
 # %%
+# Geometry-only classification leakage guard + compare cluster selector
+if "CLASSIFICATION_GEOMETRY_ONLY" not in globals() or not bool(CLASSIFICATION_GEOMETRY_ONLY):
+    raise AssertionError("Classification stage must be geometry-only.")
+if "CLASSIFICATION_FEATURE_COLUMNS" not in globals():
+    raise NameError("Missing CLASSIFICATION_FEATURE_COLUMNS; run clustering cell first.")
+
+_banned = ("gene", "feature_name", "marker", "pathway", "cpm", "expr", "embedding", "cell_type")
+_leak = [c for c in CLASSIFICATION_FEATURE_COLUMNS if any(tok in str(c).lower() for tok in _banned)]
+if _leak:
+    raise AssertionError(f"Feature leakage detected in classification inputs: {_leak[:10]}")
+
+if "grid_pd" not in globals():
+    raise NameError("Missing grid_pd; run clustering cell first.")
+if "get_compare_context" not in globals():
+    raise NameError("Missing get_compare_context; run clustering cell first.")
+
+valid_clusters = sorted(int(v) for v in np.unique(grid_pd["cluster_sorted"].to_numpy(np.int32)) if int(v) >= 0)
+if len(valid_clusters) < 2:
+    raise ValueError("Need at least two valid clusters for downstream biological validation.")
+
+SELECT_CLUSTER_A = int(globals().get("SELECT_CLUSTER_A", globals().get("COMPARE_CLUSTER_A", valid_clusters[-2])))
+SELECT_CLUSTER_B = int(globals().get("SELECT_CLUSTER_B", globals().get("COMPARE_CLUSTER_B", valid_clusters[-1])))
+
+if SELECT_CLUSTER_A == SELECT_CLUSTER_B:
+    raise ValueError("SELECT_CLUSTER_A and SELECT_CLUSTER_B must be different.")
+if SELECT_CLUSTER_A not in valid_clusters or SELECT_CLUSTER_B not in valid_clusters:
+    raise ValueError(
+        f"Selected clusters must be in valid clusters: {valid_clusters}. "
+        f"Got A={SELECT_CLUSTER_A}, B={SELECT_CLUSTER_B}."
+    )
+
+COMPARE_CLUSTER_A = int(SELECT_CLUSTER_A)
+COMPARE_CLUSTER_B = int(SELECT_CLUSTER_B)
+COMPARE_CONTEXT = get_compare_context()
+ctx = COMPARE_CONTEXT
+
+_sizes = grid_pd.loc[grid_pd["cluster_sorted"].isin([COMPARE_CLUSTER_A, COMPARE_CLUSTER_B]), "cluster_sorted"].value_counts().to_dict()
+print("=" * 70)
+print("Compare cluster selection")
+print("=" * 70)
+print(f"Selected cluster A: {COMPARE_CLUSTER_A} (n={int(_sizes.get(COMPARE_CLUSTER_A, 0)):,})")
+print(f"Selected cluster B: {COMPARE_CLUSTER_B} (n={int(_sizes.get(COMPARE_CLUSTER_B, 0)):,})")
+print(f"Region A/B: {ctx['region_a']} vs {ctx['region_b']}")
+print("=" * 70)
+
+
 # %%
 # ===========================================================================
 # Grid-level count matrix, marker ranking, and differential expression
@@ -1198,7 +2406,7 @@ else:
     print("  (none)")
 print("=" * 70)
 
-# %%
+
 # %%
 # ===========================================================================
 # DGE visualization (lollipop + expression scatter)
@@ -1364,329 +2572,268 @@ fig.suptitle(
 plt.tight_layout()
 plt.show()
 
-# %%
+
 # %%
 # ===========================================================================
-# Multi-scale sensitivity analysis
-# 多尺度敏感性分析
+# Multi-scale biological validation (real per-scale DGE)
 # ===========================================================================
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
+import seaborn as sns
 from scipy import stats
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.multitest import multipletests
+from matplotlib.colors import Normalize
 
-# ---------------------------------------------------------------------------
-# Context and configuration
-# 上下文与配置
-# ---------------------------------------------------------------------------
 ctx = get_compare_context()
-a, b = ctx["cluster_a"], ctx["cluster_b"]
+cluster_a, cluster_b = int(ctx["cluster_a"]), int(ctx["cluster_b"])
 gA, gB = ctx["group_a"], ctx["group_b"]
 cA, cB = ctx["color_a"], ctx["color_b"]
 colA, colB = ctx["cpm_col_a"], ctx["cpm_col_b"]
 
-# Grid resolutions to sweep (um).
-# 扫描的网格分辨率（微米）。
-SCALE_RANGE_UM = [10, 20, 30, 40, 50, 60, 80, 100]
+SIG_GENE_TOP_N = 60
+CATEGORY_FC_THRESHOLD = 0.25
+MIN_GRIDS_PER_SCALE = 100
+MIN_GRIDS_PER_GROUP = 25
+MAX_SCORE_VIS = 50.0
 
-# Candidate genes to track across scales.
-# 跨尺度追踪的候选基因。
-CANDIDATE_GENES = [
+MANUAL_CANDIDATE_GENES = [
     "ADIPOQ", "LEP", "LPL", "ADH1B",
     "GZMB", "IL2RA", "CSF3", "PTPRC", "CD3E", "CD8A", "PDCD1",
     "EPCAM", "KRT8", "KRT7", "ELF3",
-    "MKI67", "TOP2A", "PCNA",
-    "KRAS", "HRAS", "NRAS", "MAPK1",
-    "ACTB", "VIM", "FN1",
+    "MKI67", "TOP2A", "PCNA", "VIM", "FN1",
 ]
 
-# Minimum grids required per scale to proceed.
-# 每个尺度下继续分析所需的最小网格数。
-MIN_GRIDS_PER_SCALE = 100
+required_globals = ["grid_pd", "df_binned", "SIGMA_LIST_UM", "N_COMPONENTS", "RANDOM_SEED", "dge_results"]
+missing_globals = [name for name in required_globals if name not in globals()]
+if missing_globals:
+    raise NameError("Missing required globals: " + ", ".join(missing_globals) + ". Run previous cells first.")
+if "PSEUDOCOUNT" not in globals():
+    raise NameError("Missing PSEUDOCOUNT from DGE cell.")
 
-# Minimum transcripts per grid at each scale.
-# 每个尺度下每个网格的最小转录本数。
-MIN_TRANSCRIPTS_PER_GRID_SCALE = 5
+req_dge_cols = {"qval", "log2FC", "Mean_CPM"}
+miss_dge_cols = req_dge_cols - set(dge_results.columns)
+if miss_dge_cols:
+    raise ValueError(f"dge_results missing required columns: {sorted(miss_dge_cols)}")
 
-# Category assignment threshold on mean log2FC across scales.
-# 基于跨尺度平均 log2FC 的分类阈值。
-CATEGORY_FC_THRESHOLD = 0.25
+dge_rank = dge_results.copy()
+dge_rank["abs_log2FC"] = dge_rank["log2FC"].abs()
+sig_tbl = dge_rank.loc[
+    (dge_rank["qval"] < float(globals().get("DGE_Q_THRESHOLD", 0.05)))
+    & (dge_rank["Mean_CPM"] >= float(globals().get("DGE_MEAN_CPM_THRESHOLD", 5.0)))
+].sort_values(["qval", "abs_log2FC"], ascending=[True, False])
+sig_genes = sig_tbl.index.astype(str).tolist()[: int(SIG_GENE_TOP_N)]
 
-# Upper bound for significance score in visualization (capped for readability).
-# 可视化中显著性分数的上限（为可读性截断）。
-MAX_SCORE_VIS = 50.0
+if isinstance(df_binned, pl.DataFrame):
+    df_binned_lf = df_binned.lazy()
+    available_genes = set(df_binned["feature_name"].unique().to_list())
+else:
+    df_binned_lf = df_binned
+    available_genes = set(df_binned_lf.select(pl.col("feature_name").unique()).collect().to_series().to_list())
 
-# ---------------------------------------------------------------------------
-# Filter candidate genes to those present in the dataset
-# 将候选基因限制为数据集中存在的基因
-# ---------------------------------------------------------------------------
-available_genes = set(df.select("feature_name").unique().to_series().to_list())
-GENES = [g for g in CANDIDATE_GENES if g in available_genes]
-if not GENES:
-    raise ValueError("No candidate genes found in the dataset")
+genes = []
+_seen = set()
+for g in sig_genes + MANUAL_CANDIDATE_GENES:
+    gs = str(g)
+    if gs in available_genes and gs not in _seen:
+        genes.append(gs)
+        _seen.add(gs)
+if not genes:
+    raise ValueError("No genes available for multi-scale DGE (after top-N + manual candidate filtering).")
 
-print(f"Tracking {len(GENES)} genes across {len(SCALE_RANGE_UM)} scales")
-print(f"Compare: {gA} vs {gB}")
+print("=" * 72)
+print("Multi-scale biological validation setup")
+print("=" * 72)
+print(f"Compare clusters: {cluster_a} vs {cluster_b}")
+print(f"Compare groups  : {gA} vs {gB}")
+print(f"Sigma scales    : {[int(float(s)) for s in SIGMA_LIST_UM]}")
+print(f"Gene count      : {len(genes)} (top sig + manual)")
+print("=" * 72)
 
-# ---------------------------------------------------------------------------
-# Per-scale GMM + DGE loop
-# 逐尺度 GMM + 差异表达循环
-# ---------------------------------------------------------------------------
 rows = []
+scales_done = []
+cov_type = str(ctx.get("gmm_covariance_type", "diag"))
 
-for bs in SCALE_RANGE_UM:
-    print(f"  scale={bs} um ... ", end="")
-
-    # Grid aggregation at current scale.
-    # 在当前尺度下进行网格聚合。
-    cg = (
-        df.lazy()
-        .with_columns(
-            (pl.col("x_location") / bs).floor().cast(pl.Int32).alias("x_bin"),
-            (pl.col("y_location") / bs).floor().cast(pl.Int32).alias("y_bin"),
-        )
-        .group_by(["x_bin", "y_bin"])
-        .agg(
-            pl.col("z_location").std().alias("z_std"),
-            pl.len().alias("count"),
-        )
-        .filter(pl.col("count") >= MIN_TRANSCRIPTS_PER_GRID_SCALE)
-        .collect()
-        .to_pandas()
-        .dropna()
-    )
-
-    if len(cg) < MIN_GRIDS_PER_SCALE:
-        print("skipped (too few grids)")
+for sigma in sorted(int(float(s)) for s in SIGMA_LIST_UM):
+    cols = [f"rho_sigma_s{sigma}", f"z_std_all_sigma_s{sigma}", f"z_std_diff_enhanced_s{sigma}"]
+    if any(c not in grid_pd.columns for c in cols):
+        print(f"[scale {sigma}] skipped: missing columns")
         continue
 
-    # GMM clustering at current scale.
-    # 在当前尺度下进行 GMM 聚类。
-    feat = cg[["count", "z_std"]].copy()
-    feat["log_density"] = np.log1p(feat["count"])
-    X_scaled = StandardScaler().fit_transform(feat[["log_density", "z_std"]])
+    work = grid_pd[["x_bin", "y_bin", "transcript_count"] + cols].dropna(subset=cols).reset_index(drop=True)
+    if len(work) < MIN_GRIDS_PER_SCALE:
+        print(f"[scale {sigma}] skipped: too few grids ({len(work)})")
+        continue
+
+    X = work[cols].to_numpy(np.float32)
+    Xs = StandardScaler().fit_transform(X).astype(np.float32, copy=False)
 
     gmm = GaussianMixture(
         n_components=int(N_COMPONENTS),
-        random_state=int(RANDOM_SEED),
-        covariance_type="full",
+        covariance_type=cov_type,
+        reg_covar=1e-6,
+        random_state=int(RANDOM_SEED + sigma),
     )
-    cg["cluster_raw"] = gmm.fit_predict(X_scaled)
+    work["cluster_raw"] = gmm.fit_predict(Xs).astype(np.int32)
 
-    rank = cg.groupby("cluster_raw")["count"].median().sort_values()
-    map_id = {old: new for new, old in enumerate(rank.index)}
-    cg["cluster_sorted"] = cg["cluster_raw"].map(map_id).astype(int)
+    rank = work.groupby("cluster_raw")["transcript_count"].median().sort_values()
+    remap = {int(old): int(new) for new, old in enumerate(rank.index.tolist())}
+    work["cluster_sorted"] = work["cluster_raw"].map(remap).astype(np.int32)
 
-    comp = cg[cg["cluster_sorted"].isin([a, b])].copy()
+    comp = work.loc[
+        work["cluster_sorted"].isin([cluster_a, cluster_b]),
+        ["x_bin", "y_bin", "transcript_count", "cluster_sorted"],
+    ].copy()
     if comp.empty:
-        print("skipped (compare clusters absent)")
+        print(f"[scale {sigma}] skipped: compare clusters absent")
         continue
 
-    comp["dge_group"] = np.where(comp["cluster_sorted"] == a, gA, gB)
-    if (comp["dge_group"] == gA).sum() == 0 or (comp["dge_group"] == gB).sum() == 0:
-        print("skipped (one group empty)")
+    comp["dge_group"] = np.where(comp["cluster_sorted"] == cluster_a, gA, gB)
+    n_a = int((comp["dge_group"] == gA).sum())
+    n_b = int((comp["dge_group"] == gB).sum())
+    if n_a < MIN_GRIDS_PER_GROUP or n_b < MIN_GRIDS_PER_GROUP:
+        print(f"[scale {sigma}] skipped: too few compare grids ({gA}={n_a}, {gB}={n_b})")
         continue
 
-    # Gene-level counts at current scale.
-    # 在当前尺度下的基因级计数。
-    gc = (
-        df.lazy()
-        .filter(pl.col("feature_name").is_in(GENES))
-        .with_columns(
-            (pl.col("x_location") / bs).floor().cast(pl.Int32).alias("x_bin"),
-            (pl.col("y_location") / bs).floor().cast(pl.Int32).alias("y_bin"),
-        )
-        .group_by(["x_bin", "y_bin", "feature_name"])
+    comp_pl = pl.from_pandas(comp[["x_bin", "y_bin", "dge_group", "transcript_count"]])
+    counts_scale = (
+        df_binned_lf
+        .filter(pl.col("feature_name").is_in(genes))
+        .join(comp_pl.lazy(), on=["x_bin", "y_bin"], how="inner")
+        .group_by(["x_bin", "y_bin", "dge_group", "transcript_count", "feature_name"])
         .agg(pl.len().alias("gene_count"))
         .collect()
         .to_pandas()
     )
-
-    grids_a = comp.loc[comp["dge_group"] == gA, ["x_bin", "y_bin", "count"]].copy()
-    grids_b = comp.loc[comp["dge_group"] == gB, ["x_bin", "y_bin", "count"]].copy()
-
-    gc_pivot = (
-        gc.pivot(index=["x_bin", "y_bin"], columns="feature_name", values="gene_count")
-        .fillna(0)
-    )
-    gene_cols = [g for g in GENES if g in gc_pivot.columns]
-    if not gene_cols:
-        print("skipped (no gene overlap)")
+    if counts_scale.empty:
+        print(f"[scale {sigma}] skipped: no gene counts after join")
         continue
 
-    a_merged = grids_a.merge(gc_pivot[gene_cols], on=["x_bin", "y_bin"], how="left").fillna(0)
-    b_merged = grids_b.merge(gc_pivot[gene_cols], on=["x_bin", "y_bin"], how="left").fillna(0)
+    mat = (
+        counts_scale
+        .pivot(index=["x_bin", "y_bin", "dge_group", "transcript_count"], columns="feature_name", values="gene_count")
+        .fillna(0)
+    )
 
-    cpm_x_mat = (a_merged[gene_cols].values / a_merged["count"].values[:, None]) * 1e6
-    cpm_y_mat = (b_merged[gene_cols].values / b_merged["count"].values[:, None]) * 1e6
+    gene_cols = [g for g in genes if g in mat.columns]
+    if not gene_cols:
+        print(f"[scale {sigma}] skipped: no overlap genes in pivot")
+        continue
 
-    mean_a_arr = cpm_x_mat.mean(axis=0)
-    mean_b_arr = cpm_y_mat.mean(axis=0)
-    log2fc_arr = np.log2((mean_a_arr + PSEUDOCOUNT) / (mean_b_arr + PSEUDOCOUNT))
+    meta = mat.index.to_frame(index=False)
+    lib = meta["transcript_count"].to_numpy(np.float32)
+    cpm = mat[gene_cols].div(lib, axis=0).fillna(0.0) * 1e6
 
-    _, p_arr = stats.mannwhitneyu(cpm_x_mat, cpm_y_mat, alternative="two-sided", axis=0)
-    var_x = cpm_x_mat.var(axis=0)
-    var_y = cpm_y_mat.var(axis=0)
+    grp = meta["dge_group"].astype(str).to_numpy()
+    x_mat = cpm.loc[grp == gA].to_numpy(np.float32)
+    y_mat = cpm.loc[grp == gB].to_numpy(np.float32)
+
+    if len(x_mat) < MIN_GRIDS_PER_GROUP or len(y_mat) < MIN_GRIDS_PER_GROUP:
+        print(f"[scale {sigma}] skipped: insufficient matrices after CPM")
+        continue
+
+    mean_a = x_mat.mean(axis=0)
+    mean_b = y_mat.mean(axis=0)
+    log2fc = np.log2((mean_a + float(PSEUDOCOUNT)) / (mean_b + float(PSEUDOCOUNT)))
+
+    _, p_arr = stats.mannwhitneyu(x_mat, y_mat, alternative="two-sided", axis=0)
+    var_x = x_mat.var(axis=0)
+    var_y = y_mat.var(axis=0)
     p_arr[(var_x == 0.0) & (var_y == 0.0)] = 1.0
     p_arr = np.where(np.isnan(p_arr), 1.0, p_arr)
 
     for j, gene in enumerate(gene_cols):
         rows.append({
-            "scale_um": int(bs),
-            "gene": gene,
-            "log2FC": float(log2fc_arr[j]),
+            "scale_um": int(sigma),
+            "gene": str(gene),
+            "log2FC": float(log2fc[j]),
             "pval": float(p_arr[j]),
-            colA: float(mean_a_arr[j]),
-            colB: float(mean_b_arr[j]),
+            colA: float(mean_a[j]),
+            colB: float(mean_b[j]),
         })
 
-    print("done")
+    scales_done.append(int(sigma))
+    print(f"[scale {sigma}] done: genes={len(gene_cols)}, grids=({n_a},{n_b})")
 
 if not rows:
-    raise ValueError("No multi-scale results generated")
+    raise ValueError("No multi-scale DGE results generated.")
 
-# ---------------------------------------------------------------------------
-# Multiple testing correction
-# 多重检验校正
-# ---------------------------------------------------------------------------
 res_df = pd.DataFrame(rows)
-
-# Unify column names to lowercase.
-# 统一列名为小写。
-res_df = res_df.rename(columns={"Scale_um": "scale_um", "Gene": "gene"})
-
-_, qvals, _, _ = multipletests(res_df["pval"], method="fdr_bh")
+_, qvals, _, _ = multipletests(res_df["pval"].fillna(1.0), method="fdr_bh")
 res_df["qval"] = qvals
-res_df["significance_score"] = -np.log10(res_df["qval"] + 1e-100)
+res_df["significance_score"] = -np.log10(res_df["qval"] + 1e-300)
 res_df["vis_size"] = res_df["significance_score"].clip(upper=MAX_SCORE_VIS)
 
-# ---------------------------------------------------------------------------
-# Bubble heatmap
-# 气泡热图
-# ---------------------------------------------------------------------------
+mean_fc = res_df.groupby("gene")["log2FC"].mean()
+catA = f"{gA}_enriched"
+catB = f"{gB}_enriched"
+catM = "mixed"
+
+plot_df = res_df.copy()
+plot_df["category"] = plot_df["gene"].map(
+    lambda g: catA if mean_fc[g] > CATEGORY_FC_THRESHOLD
+    else (catB if mean_fc[g] < -CATEGORY_FC_THRESHOLD else catM)
+)
+category_colors = {catA: cA, catB: cB, catM: "dimgray"}
+
+print("=" * 72)
+print("Multi-scale DGE summary")
+print("=" * 72)
+print(f"Scales completed : {sorted(set(scales_done))}")
+print(f"Rows in res_df   : {len(res_df):,}")
+print(f"Genes in plot_df : {plot_df['gene'].nunique():,}")
+print("=" * 72)
+
 pfc = res_df.pivot(index="gene", columns="scale_um", values="log2FC")
 psig = res_df.pivot(index="gene", columns="scale_um", values="vis_size")
+if pfc.empty:
+    raise ValueError("Empty pivot for bubble heatmap.")
+
 order = pfc.mean(axis=1).sort_values(ascending=False).index
 pfc = pfc.loc[order]
 psig = psig.loc[order]
 
-fig, ax = plt.subplots(figsize=(14, max(6, len(pfc) * 0.45 + 2)))
-
+fig, ax = plt.subplots(figsize=(14, max(6, len(pfc) * 0.35 + 2)))
 xx, yy = np.meshgrid(np.arange(len(pfc.columns)), np.arange(len(pfc.index)))
-fc = pfc.to_numpy().flatten()
-sig = psig.to_numpy().flatten()
-size = (np.nan_to_num(sig, nan=0.0) / MAX_SCORE_VIS) * 300 + 10
+fc = pfc.to_numpy(np.float32).ravel()
+sig = psig.to_numpy(np.float32).ravel()
+size = (np.nan_to_num(sig, nan=0.0) / MAX_SCORE_VIS) * 300.0 + 10.0
 
 abs_fc = np.abs(fc[np.isfinite(fc)])
 lim = float(np.max(abs_fc)) if abs_fc.size else 1.0
 
 sc = ax.scatter(
-    xx.flatten(), yy.flatten(),
-    s=size, c=fc,
+    xx.ravel(),
+    yy.ravel(),
+    s=size,
+    c=fc,
     cmap=ctx["cmap_ab"],
     norm=Normalize(vmin=-lim, vmax=lim),
-    edgecolors="black", linewidth=0.5, alpha=0.9,
+    edgecolors="black",
+    linewidth=0.4,
+    alpha=0.9,
 )
 
 ax.set_xticks(np.arange(len(pfc.columns)))
-ax.set_xticklabels([str(x) for x in pfc.columns], fontsize=12)
+ax.set_xticklabels([str(x) for x in pfc.columns], fontsize=11)
 ax.set_yticks(np.arange(len(pfc.index)))
-ax.set_yticklabels(pfc.index, fontsize=11, fontweight="bold")
-ax.set_xlabel("Grid resolution (um)", fontsize=14, fontweight="bold")
-ax.set_ylabel("Gene", fontsize=14, fontweight="bold")
-ax.set_title(
-    f"Multi-scale sensitivity (log2FC: {gA} vs {gB})",
-    fontsize=15, fontweight="bold", pad=18,
-)
+ax.set_yticklabels(pfc.index, fontsize=10)
+ax.set_xlabel("Sigma scale (um)", fontsize=12, fontweight="bold")
+ax.set_ylabel("Gene", fontsize=12, fontweight="bold")
+ax.set_title(f"Multi-scale DGE bubble heatmap ({gA} vs {gB})", fontsize=14, fontweight="bold")
+ax.grid(True, linestyle="--", alpha=0.2)
+ax.set_axisbelow(True)
 
 cb = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.02)
-cb.set_label(f"log2FC ({gA} vs {gB})", fontsize=12)
-
-handles = [
-    plt.scatter([], [], s=((s / MAX_SCORE_VIS) * 300 + 10), c="gray", edgecolors="black", label=f"q ~ 1e-{s}")
-    for s in [10, 50]
-]
-ax.legend(
-    handles=handles, title="Significance (q-value)",
-    loc="upper left", bbox_to_anchor=(1.12, 1), frameon=False,
-)
-ax.grid(True, linestyle="--", alpha=0.3)
-ax.set_axisbelow(True)
+cb.set_label(f"log2FC ({gA} vs {gB})", fontsize=11)
 
 plt.tight_layout()
 plt.show()
 
-# ---------------------------------------------------------------------------
-# Gene category assignment for downstream trajectory plot
-# 为下游轨迹图分配基因类别
-# ---------------------------------------------------------------------------
-mean_fc = res_df.groupby("gene")["log2FC"].mean()
-catA_label = f"{gA}_enriched"
-catB_label = f"{gB}_enriched"
-catM_label = "mixed"
-
-plot_df = res_df.copy()
-plot_df["category"] = plot_df["gene"].map(
-    lambda g: catA_label if mean_fc[g] > CATEGORY_FC_THRESHOLD
-    else (catB_label if mean_fc[g] < -CATEGORY_FC_THRESHOLD else catM_label)
-)
-category_colors = {catA_label: cA, catB_label: cB, catM_label: "dimgray"}
-
-print("=" * 70)
-print("Multi-scale sensitivity analysis summary")
-print("=" * 70)
-print(f"Scales evaluated : {sorted(res_df['scale_um'].unique().tolist())}")
-print(f"Genes tracked    : {len(GENES)}")
-print(f"Total comparisons: {len(res_df)}")
-print("=" * 70)
-
-# %%
-# %%
-# ===========================================================================
-# Multi-scale log2FC trajectories
-# 多尺度 log2FC 轨迹
-# ===========================================================================
-
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-
-# ---------------------------------------------------------------------------
-# Context
-# 上下文
-# ---------------------------------------------------------------------------
-ctx = get_compare_context()
-gA, gB = ctx["group_a"], ctx["group_b"]
-cA, cB = ctx["color_a"], ctx["color_b"]
-
-# ---------------------------------------------------------------------------
-# Input check
-# 输入检查
-# ---------------------------------------------------------------------------
-required_cols = {"scale_um", "gene", "log2FC", "category"}
-if "plot_df" not in globals() or not required_cols.issubset(plot_df.columns):
-    raise ValueError("Missing plot_df with required columns from multi-scale analysis")
-if "category_colors" not in globals():
-    category_colors = {f"{gA}_enriched": cA, f"{gB}_enriched": cB, "mixed": "dimgray"}
-
-# Genes to label at the rightmost scale.
-# 在最大尺度处标注的基因。
-LABEL_GENES = ["ADIPOQ", "GZMB", "KRT8", "EPCAM", "CD3E", "TOP2A", "LEP"]
-
-# Reference lines for log2FC (|log2FC|=1 corresponds to a 2-fold change).
-# log2FC 参考线（|log2FC|=1 对应 2 倍变化）。
-REFERENCE_FC = 1.0
-
-# ---------------------------------------------------------------------------
-# Figure
-# 作图
-# ---------------------------------------------------------------------------
 fig, ax = plt.subplots(figsize=(12, 8))
 
 sns.lineplot(
@@ -1698,56 +2845,49 @@ sns.lineplot(
     units="gene",
     estimator=None,
     palette=category_colors,
-    linewidth=2.2,
-    alpha=0.8,
+    linewidth=2.0,
+    alpha=0.75,
     ax=ax,
     markers=True,
     dashes=False,
 )
 
-absmax = float(max(2.0, np.nanmax(np.abs(plot_df["log2FC"].to_numpy(float))) * 1.15))
+absmax = float(max(2.0, np.nanmax(np.abs(plot_df["log2FC"].to_numpy(np.float32))) * 1.15))
 scale_min = float(plot_df["scale_um"].min())
 scale_max = float(plot_df["scale_um"].max())
 
 ax.set_ylim(-absmax, absmax)
-ax.set_xlim(scale_min - 5, scale_max + 15)
+ax.set_xlim(scale_min - 3, scale_max + 10)
 
-ax.axhline(0, color="black", linewidth=1.5)
-ax.axhline(REFERENCE_FC, color="gray", linewidth=1, linestyle="--", alpha=0.5)
-ax.axhline(-REFERENCE_FC, color="gray", linewidth=1, linestyle="--", alpha=0.5)
+ax.axhline(0.0, color="black", linewidth=1.4)
+ax.axhline(1.0, color="gray", linewidth=1.0, linestyle="--", alpha=0.5)
+ax.axhline(-1.0, color="gray", linewidth=1.0, linestyle="--", alpha=0.5)
 
 ax.axhspan(0.5, absmax, color=cA, alpha=0.06)
 ax.axhspan(-absmax, -0.5, color=cB, alpha=0.06)
 
-ax.text(ax.get_xlim()[1] - 8, absmax * 0.55, f"{gA} enriched", color=cA, fontsize=11, fontweight="bold", va="center")
-ax.text(ax.get_xlim()[1] - 8, -absmax * 0.55, f"{gB} enriched", color=cB, fontsize=11, fontweight="bold", va="center")
+ax.text(ax.get_xlim()[1] - 6, absmax * 0.55, f"{gA} enriched", color=cA, fontsize=10, fontweight="bold", va="center")
+ax.text(ax.get_xlim()[1] - 6, -absmax * 0.55, f"{gB} enriched", color=cB, fontsize=10, fontweight="bold", va="center")
 
-for gene in LABEL_GENES:
+label_genes = [g for g in MANUAL_CANDIDATE_GENES if g in plot_df["gene"].unique()]
+for gene in label_genes[:10]:
     sub = plot_df[(plot_df["gene"] == gene) & (plot_df["scale_um"] == scale_max)]
     if not sub.empty:
-        ax.text(
-            scale_max + 1.5,
-            float(sub["log2FC"].iloc[0]),
-            gene,
-            fontsize=9,
-            fontweight="bold",
-            va="center",
-        )
+        ax.text(scale_max + 0.8, float(sub["log2FC"].iloc[0]), gene, fontsize=8, fontweight="bold", va="center")
 
-ax.set_title(
-    f"Multi-scale log2FC trajectories ({gA} vs {gB})",
-    fontsize=16,
-    fontweight="bold",
-    pad=20,
-)
-ax.set_xlabel("Grid resolution (um)", fontsize=14, fontweight="bold")
-ax.set_ylabel(f"log2FC ({gA} vs {gB})", fontsize=14, fontweight="bold")
-ax.legend(title="Category", loc="upper left", bbox_to_anchor=(1.02, 1), frameon=False, fontsize=10)
+ax.set_title(f"Multi-scale log2FC trajectories ({gA} vs {gB})", fontsize=14, fontweight="bold")
+ax.set_xlabel("Sigma scale (um)", fontsize=12, fontweight="bold")
+ax.set_ylabel(f"log2FC ({gA} / {gB})", fontsize=12, fontweight="bold")
+ax.grid(True, linestyle="--", alpha=0.25)
+
+leg = ax.legend(title="Category", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=True)
+if leg is not None:
+    leg.get_title().set_fontsize(10)
 
 plt.tight_layout()
 plt.show()
 
-# %%
+
 # %%
 # ===========================================================================
 # Pathway enrichment analysis
@@ -1968,7 +3108,7 @@ else:
     print(format_top_terms(dfB))
     print("=" * 70)
 
-# %%
+
 # %%
 # ===========================================================================
 # Marker-group scoring and comparison
@@ -2011,8 +3151,8 @@ def cohens_d(a, b):
     Cohen's d with pooled standard deviation.
     使用合并标准差计算 Cohen's d。
     """
-    a = np.asarray(a, float)
-    b = np.asarray(b, float)
+    a = np.asarray(a, np.float32)
+    b = np.asarray(b, np.float32)
     a = a[np.isfinite(a)]
     b = b[np.isfinite(b)]
     if len(a) < 2 or len(b) < 2:
@@ -2065,15 +3205,13 @@ idx_df = score_mat.index.to_frame(index=False)
 
 # grid_cpm index should contain cluster_sorted from the merged block.
 # grid_cpm 的索引应包含合并段中的 cluster_sorted。
-if "cluster_sorted" in idx_df.columns:
-    idx_df["region"] = np.where(
-        idx_df["cluster_sorted"] == ctx["cluster_a"], gA,
-        np.where(idx_df["cluster_sorted"] == ctx["cluster_b"], gB, ""),
-    )
-elif "dge_group" in idx_df.columns:
-    idx_df["region"] = idx_df["dge_group"].astype(str)
-else:
-    raise ValueError("Cannot determine region from grid_cpm index (need cluster_sorted or dge_group)")
+if "cluster_sorted" not in idx_df.columns:
+    raise ValueError(f"grid_cpm index must include cluster_sorted, got: {idx_df.columns.tolist()}")
+
+idx_df["region"] = np.where(
+    idx_df["cluster_sorted"] == ctx["cluster_a"], gA,
+    np.where(idx_df["cluster_sorted"] == ctx["cluster_b"], gB, ""),
+)
 
 x_col, y_col = "x_um", "y_um"
 coord_map = grid_pd[["x_bin", "y_bin", x_col, y_col]].drop_duplicates(["x_bin", "y_bin"])
@@ -2138,7 +3276,7 @@ for i, grp in enumerate(sorted_groups):
 
     # Spatial score map.
     # 空间评分图。
-    vals = score_df_filtered[grp].to_numpy(float)
+    vals = score_df_filtered[grp].to_numpy(np.float32)
     fp = vals[np.isfinite(vals) & (vals > 0)]
     if fp.size >= 2:
         vmin, vmax = np.percentile(fp, [2, 98])
@@ -2197,8 +3335,8 @@ plt.show()
 # ---------------------------------------------------------------------------
 stat_rows = []
 for grp in marker_cols:
-    a = sub.loc[sub["region"] == gA, grp].to_numpy(float)
-    b = sub.loc[sub["region"] == gB, grp].to_numpy(float)
+    a = sub.loc[sub["region"] == gA, grp].to_numpy(np.float32)
+    b = sub.loc[sub["region"] == gB, grp].to_numpy(np.float32)
     a = a[np.isfinite(a)]
     b = b[np.isfinite(b)]
 
@@ -2221,7 +3359,7 @@ for grp in marker_cols:
     })
 
 effect_stats_table = pd.DataFrame(stat_rows)
-_, q, _, _ = multipletests(effect_stats_table["pval_mwu"].fillna(1.0).to_numpy(float), method="fdr_bh")
+_, q, _, _ = multipletests(effect_stats_table["pval_mwu"].fillna(1.0).to_numpy(np.float32), method="fdr_bh")
 effect_stats_table["qval_mwu"] = q
 effect_stats_table["neglog10_qval_mwu"] = -np.log10(effect_stats_table["qval_mwu"] + 1e-300)
 effect_stats_table = (
@@ -2244,7 +3382,7 @@ print(
 )
 print("=" * 80)
 
-# %%
+
 # %%
 # ===========================================================================
 # Radius sensitivity sweep with partial Spearman correlations
@@ -2286,7 +3424,7 @@ if "score_df_filtered" not in globals():
     raise NameError("Missing score_df_filtered")
 
 x_col, y_col = "x_um", "y_um"
-z_col = "z_stacking_index_um" if "z_stacking_index_um" in grid_pd.columns else "z_stacking_index"
+z_col = "z_std_all_ref"
 
 req = {x_col, y_col, z_col, "transcript_count"}
 miss = req - set(grid_pd.columns)
@@ -2320,10 +3458,10 @@ base["dominant_marker_group"] = base[marker_cols].idxmax(axis=1)
 region_order = [gA, gB]
 color_map = {gA: cA, gB: cB}
 
-coords = base[["x_coord", "y_coord"]].to_numpy(float)
+coords = base[["x_coord", "y_coord"]].to_numpy(np.float32)
 tree = cKDTree(coords)
 dom = base["dominant_marker_group"].to_numpy()
-scores = np.clip(base[marker_cols].to_numpy(float), 0.0, None)
+scores = np.clip(base[marker_cols].to_numpy(np.float32), 0.0, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2335,8 +3473,8 @@ def spearman(x, y, min_n=MIN_SAMPLES_CORR):
     Spearman rank correlation with minimum sample guard.
     带最小样本量保护的 Spearman 秩相关。
     """
-    x = np.asarray(x, float)
-    y = np.asarray(y, float)
+    x = np.asarray(x, np.float32)
+    y = np.asarray(y, np.float32)
     m = np.isfinite(x) & np.isfinite(y)
     x, y = x[m], y[m]
     if len(x) < min_n:
@@ -2353,9 +3491,9 @@ def partial_spearman(x, y, c, min_n=MIN_SAMPLES_CORR):
     Residualize ranks of x and y on ranks of c via OLS, then correlate residuals.
     对 x 和 y 的秩在 c 的秩上做 OLS 残差化，再对残差求相关。
     """
-    x = np.asarray(x, float)
-    y = np.asarray(y, float)
-    c = np.asarray(c, float)
+    x = np.asarray(x, np.float32)
+    y = np.asarray(y, np.float32)
+    c = np.asarray(c, np.float32)
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(c)
     x, y, c = x[m], y[m], c[m]
     n = int(len(x))
@@ -2366,7 +3504,7 @@ def partial_spearman(x, y, c, min_n=MIN_SAMPLES_CORR):
     ry = stats.rankdata(y, method="average")
     rc = stats.rankdata(c, method="average")
 
-    D = np.column_stack([np.ones(n), rc])
+    D = np.column_stack([np.ones(n, np.float32), rc]).astype(np.float32, copy=False)
     bx, *_ = np.linalg.lstsq(D, rx, rcond=None)
     by, *_ = np.linalg.lstsq(D, ry, rcond=None)
 
@@ -2390,8 +3528,8 @@ def compute_neighborhood_metrics(radius):
     nbrs = tree.query_ball_point(coords, r=float(radius))
     area = float(np.pi * (radius ** 2))
 
-    den = np.empty(len(base), float)
-    soft = np.empty(len(base), float)
+    den = np.empty(len(base), np.float32)
+    soft = np.empty(len(base), np.float32)
 
     for i, idx in enumerate(nbrs):
         idx = [j for j in idx if j != i]
@@ -2411,7 +3549,7 @@ def compute_neighborhood_metrics(radius):
 # Sweep across radii
 # 跨半径扫描
 # ---------------------------------------------------------------------------
-cov = np.log1p(base["transcript_count"].to_numpy(float))
+cov = np.log1p(base["transcript_count"].to_numpy(np.float32))
 rows = []
 
 for radius in RADIUS_RANGE_UM:
@@ -2480,7 +3618,7 @@ axes[0, 1].legend(frameon=False)
 plt.tight_layout()
 plt.show()
 
-# %%
+
 # %%
 # ===========================================================================
 # Signed distance to boundary and interface gradient heatmap
@@ -2507,8 +3645,8 @@ BOUNDARY_RADIUS_UM = 30.0
 # Distance binning parameters for heatmap.
 # 热图的距离分箱参数。
 HEATMAP_BIN_WIDTH_UM = 20.0
-HEATMAP_DIST_MIN_UM = -300.0
-HEATMAP_DIST_MAX_UM = 300.0
+HEATMAP_DIST_MIN_UM = -400.0
+HEATMAP_DIST_MAX_UM = 400.0
 HEATMAP_MIN_COUNT_PER_BIN = 20
 
 
@@ -2536,7 +3674,7 @@ def compute_signed_distance_to_boundary(
     if df.empty:
         raise ValueError("No rows left after region filter")
 
-    coords = df[[x_col, y_col]].to_numpy(float)
+    coords = df[[x_col, y_col]].to_numpy(np.float32)
     regions = df[region_col].to_numpy()
 
     neg = regions == negative_label
@@ -2564,7 +3702,7 @@ def compute_signed_distance_to_boundary(
         raise ValueError("No boundary points found; consider increasing boundary_radius_um")
 
     d, _ = cKDTree(bcoords).query(coords, k=1)
-    signed = d.astype(float)
+    signed = d.astype(np.float32)
     signed[neg] *= -1.0
 
     df["signed_dist_um"] = signed
@@ -2623,7 +3761,7 @@ def plot_interface_heatmap(
 
     # Order features by the distance bin where they peak.
     # 按特征达到峰值的距离分箱排序。
-    xv = np.array([float(c) for c in mat.columns.astype(float)])
+    xv = np.array([float(c) for c in mat.columns.astype(np.float32)])
     peak_positions = np.nanargmax(mat.to_numpy(), axis=1)
     order = np.argsort(xv[peak_positions])
     mat = mat.iloc[order]
@@ -2634,15 +3772,24 @@ def plot_interface_heatmap(
         cmap=(ctx["cmap_ab"] if cmap is None else cmap),
         center=0.0 if zscore_by_feature else None,
         cbar_kws={"label": "Z-score" if zscore_by_feature else "Mean value"},
+        yticklabels=1,
+        xticklabels=1,
     )
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.set_ylabel("Features")
+    ax.set_xlabel("dist bin")
 
     # Mark the boundary (distance ~ 0).
     # 标记边界位置（距离 ≈ 0）。
-    xv = np.array([float(c) for c in mat.columns.astype(float)])
+    xv = np.array([float(c) for c in mat.columns.astype(np.float32)])
     if xv.size:
-        ax.axvline(int(np.argmin(np.abs(xv))), color="black", lw=1.2, alpha=0.7)
+        if np.any(xv < 0.0) and np.any(xv > 0.0):
+            neg_idx = int(np.where(xv < 0.0)[0].max())
+            pos_idx = int(np.where(xv > 0.0)[0].min())
+            xline = float(pos_idx)
+        else:
+            xline = float(np.argmin(np.abs(xv)) + 0.5)
+        ax.axvline(xline, color="black", lw=1.2, alpha=0.8)
 
     plt.tight_layout()
     plt.show()
@@ -2657,12 +3804,9 @@ def plot_interface_heatmap(
 if "base" not in globals():
     raise NameError("Missing base")
 
-if {"x_coord", "y_coord"}.issubset(base.columns):
-    x_col, y_col = "x_coord", "y_coord"
-elif {"x_um", "y_um"}.issubset(base.columns):
-    x_col, y_col = "x_um", "y_um"
-else:
-    raise ValueError(f"base missing coordinate columns, got: {sorted(base.columns.tolist())}")
+if not {"x_coord", "y_coord"}.issubset(base.columns):
+    raise ValueError(f"base must contain x_coord and y_coord, got: {sorted(base.columns.tolist())}")
+x_col, y_col = "x_coord", "y_coord"
 
 if "region" not in base.columns:
     raise ValueError("base missing region column")
@@ -2713,7 +3857,7 @@ mat, bin_counts = plot_interface_heatmap(
     cmap=ctx["cmap_ab"],
 )
 
-# %%
+
 # %%
 # ===========================================================================
 # Interface strength and sharpness metrics
@@ -2767,8 +3911,8 @@ MIN_POINTS_FOR_AUC = 10
 # 辅助函数：Cohen's d（合并标准差）
 # ---------------------------------------------------------------------------
 def _cohens_d(a, b):
-    a = np.asarray(a, float)
-    b = np.asarray(b, float)
+    a = np.asarray(a, np.float32)
+    b = np.asarray(b, np.float32)
     a = a[np.isfinite(a)]
     b = b[np.isfinite(b)]
     if len(a) < 2 or len(b) < 2:
@@ -2792,7 +3936,7 @@ def _auc_separation(scores, labels):
     AUC = U / (n1 * n0), derived from Mann-Whitney U statistic.
     AUC = U / (n1 * n0)，由 Mann-Whitney U 统计量推导。
     """
-    s = np.asarray(scores, float)
+    s = np.asarray(scores, np.float32)
     y = np.asarray(labels, int)
     m = np.isfinite(s) & np.isfinite(y)
     s, y = s[m], y[m]
@@ -2846,19 +3990,19 @@ def compute_interface_metrics(
         raise ValueError(f"Missing features: {miss}")
 
     df0 = signed_df.copy()
-    df0 = df0[np.isfinite(df0[dist_col].to_numpy(float))].copy()
+    df0 = df0[np.isfinite(df0[dist_col].to_numpy(np.float32))].copy()
     if df0.empty:
         raise ValueError("No finite distance rows")
 
     edges = np.arange(dist_min_um, dist_max_um + bin_width_um, bin_width_um)
     centers = (edges[:-1] + edges[1:]) / 2.0
 
-    dist = df0[dist_col].to_numpy(float)
+    dist = df0[dist_col].to_numpy(np.float32)
     metrics = []
     profiles = {}
 
     for feat in features:
-        y0 = df0[feat].to_numpy(float)
+        y0 = df0[feat].to_numpy(np.float32)
         m = np.isfinite(y0)
         d, y = dist[m], y0[m]
         if len(y) < MIN_POINTS_PER_FEATURE:
@@ -2894,8 +4038,8 @@ def compute_interface_metrics(
             gmax = np.nan
             profiles[feat] = (np.array([]), np.array([]), np.array([]))
         else:
-            xb = np.array([float(c) for c in prof.index.astype(float)])
-            yb = prof.to_numpy(float)
+            xb = np.array([float(c) for c in prof.index.astype(np.float32)])
+            yb = prof.to_numpy(np.float32)
             nb = cnt.to_numpy(int)
             order = np.argsort(xb)
             xb, yb, nb = xb[order], yb[order], nb[order]
@@ -3006,7 +4150,7 @@ metrics_df, profiles = compute_interface_metrics(
 
 print(metrics_df.head(30).to_string(index=False))
 
-# %%
+
 # %%
 # ===========================================================================
 # Panel-restricted differential expression
@@ -3059,14 +4203,11 @@ idx_names = list(grid_matrix.index.names) if hasattr(grid_matrix.index, "names")
 
 # Determine group membership from index.
 # 从索引中确定组别归属。
-if "cluster_sorted" in idx_names:
-    group_level = "cluster_sorted"
-    val_a, val_b = ctx["cluster_a"], ctx["cluster_b"]
-elif "dge_group" in idx_names:
-    group_level = "dge_group"
-    val_a, val_b = GROUP_A, GROUP_B
-else:
-    raise ValueError(f"grid_matrix index needs cluster_sorted or dge_group, found: {idx_names}")
+if "cluster_sorted" not in idx_names:
+    raise ValueError(f"grid_matrix index must include cluster_sorted, found: {idx_names}")
+
+group_level = "cluster_sorted"
+val_a, val_b = ctx["cluster_a"], ctx["cluster_b"]
 
 # ---------------------------------------------------------------------------
 # Build panel gene list
@@ -3183,7 +4324,7 @@ else:
     print("  (none)")
 print("=" * 70)
 
-# %%
+
 # %%
 # ===========================================================================
 # Pathway enrichment on panel-restricted DGE
@@ -3344,5 +4485,6 @@ else:
     print(f"Top terms ({gB}):")
     print(format_top_terms(dfB))
     print("=" * 70)
+
 
 
